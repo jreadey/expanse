@@ -511,6 +511,7 @@ HELP_TEXT = """[b]Virtual Orrery - Controls[/b]
   Down Arrow / Scroll Up    Zoom in
   Up Arrow / Scroll Down    Zoom out
   Mouse Drag                Pan view
+  Mouse Drag on +           Move COI marker
   R                         Reset view
 
 [b]Time:[/b]
@@ -529,6 +530,8 @@ HELP_TEXT = """[b]Virtual Orrery - Controls[/b]
 
 AU_KM = 1.496e8  # km per AU
 DEFAULT_SCALE = 120.0  # pixels per AU
+COI_ARM_PX = 13   # half-length of each arm of the COI '+' marker (screen pixels)
+COI_HIT_PX = 15   # drag-detection radius around COI centre (screen pixels)
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +631,16 @@ class OrreryWidget(Widget):
         self._drag_origin = None
         self._last_touch = None
 
+        # Centre of Interest marker
+        self.coi_au = (0.0, 0.0)        # heliocentric position in AU
+        self._drag_coi = False           # True when the current drag is moving the COI
+        self._coi_grab_offset = (0, 0)   # screen-space offset from COI centre to grab point
+
+        # COI body lock
+        self._locked_body = None         # name of body COI is locked to, or None
+        self._locked_target_sx = 0.0    # screen x we want the locked body to stay at
+        self._locked_target_sy = 0.0    # screen y we want the locked body to stay at
+
         # Time state
         self.sim_time = Time(datetime.utcnow(), scale="utc")
         self.time_factor = 1.0
@@ -688,6 +701,8 @@ class OrreryWidget(Widget):
             self.scale = DEFAULT_SCALE
             self.pan_x = 0.0
             self.pan_y = 0.0
+            self.coi_au = (0.0, 0.0)
+            self._locked_body = None
         elif key_name == "f11":
             self._fullscreen = not self._fullscreen
             Window.fullscreen = "auto" if self._fullscreen else False
@@ -713,6 +728,17 @@ class OrreryWidget(Widget):
             self.selected_body = None
             return True
 
+        # Only begin a drag when the touch is on or near the COI marker
+        coi_sx, coi_sy = self.world_to_screen(*self.coi_au)
+        coi_dist = math.hypot(touch.x - coi_sx, touch.y - coi_sy)
+        self._drag_coi = coi_dist <= COI_HIT_PX
+        if self._drag_coi:
+            # Record the vector from the touch point to the COI centre so the
+            # marker doesn't jump when dragging starts
+            self._coi_grab_offset = (coi_sx - touch.x, coi_sy - touch.y)
+            # Release any existing body lock so the drag is uncontested
+            self._locked_body = None
+
         self._dragging = False
         self._drag_origin = touch.pos
         self._last_touch = touch.pos
@@ -723,15 +749,25 @@ class OrreryWidget(Widget):
         if touch.grab_current is not self:
             return False
         if self._last_touch:
-            dx = touch.x - self._last_touch[0]
-            dy = touch.y - self._last_touch[1]
             if not self._dragging and self._drag_origin:
                 if math.hypot(touch.x - self._drag_origin[0],
                               touch.y - self._drag_origin[1]) > 5:
                     self._dragging = True
-            if self._dragging:
+            if self._dragging and self._drag_coi:
+                # Move the COI to where the marker is being dragged
+                new_sx = touch.x + self._coi_grab_offset[0]
+                new_sy = touch.y + self._coi_grab_offset[1]
+                self.coi_au = self.screen_to_world(new_sx, new_sy)
+            elif self._dragging and not self._drag_coi:
+                # Pan the view
+                dx = touch.x - self._last_touch[0]
+                dy = touch.y - self._last_touch[1]
                 self.pan_x += dx
                 self.pan_y += dy
+                # Keep the locked target position in sync so locking still works
+                if self._locked_body:
+                    self._locked_target_sx += dx
+                    self._locked_target_sy += dy
             self._last_touch = touch.pos
         return True
 
@@ -740,6 +776,8 @@ class OrreryWidget(Widget):
             touch.ungrab(self)
             if not self._dragging and self._drag_origin:
                 self._handle_click(touch.pos)
+            elif self._dragging and self._drag_coi:
+                self._check_coi_lock()
             self._dragging = False
             self._last_touch = None
             self._drag_origin = None
@@ -793,12 +831,56 @@ class OrreryWidget(Widget):
         px, py = pos
         return rx <= px <= rx + rw and ry <= py <= ry + rh
 
+    def _check_coi_lock(self):
+        """After a COI drop, lock onto the nearest body within 5× its drawn radius."""
+        self._locked_body = None
+        coi_sx, coi_sy = self.world_to_screen(*self.coi_au)
+
+        candidates = list(PLANETS + ASTEROIDS + MINOR_PLANETS)
+        for planet_name in MOONS:
+            if self._should_show_moons(planet_name):
+                candidates.extend(MOONS[planet_name])
+
+        best_name = None
+        best_dist = float("inf")
+        for body in candidates:
+            name = body["name"]
+            if name not in self.positions:
+                continue
+            sx, sy = self.world_to_screen(*self.positions[name])
+            radius_km = body.get("radius_km", 0)
+            min_px = body.get("min_px", 2)
+            px = max(radius_km / AU_KM * self.scale, min_px) if radius_km > 0 else min_px
+            dist = math.hypot(coi_sx - sx, coi_sy - sy)
+            if dist <= px * 5 and dist < best_dist:
+                best_dist = dist
+                best_name = name
+
+        if best_name:
+            self._locked_body = best_name
+            # Snap COI to body centre and record its current screen position
+            self.coi_au = self.positions[best_name]
+            self._locked_target_sx, self._locked_target_sy = self.world_to_screen(*self.coi_au)
+
+    def _update_coi_lock(self):
+        """Move COI with locked body and pan so it stays at the recorded screen position."""
+        if self._locked_body not in self.positions:
+            self._locked_body = None
+            return
+        self.coi_au = self.positions[self._locked_body]
+        coi_x, coi_y = self.coi_au
+        self.pan_x = self._locked_target_sx - self.width / 2 - coi_x * self.scale
+        self.pan_y = self._locked_target_sy - self.height / 2 - coi_y * self.scale
+
     # -- Helpers -----------------------------------------------------------
 
     def _zoom(self, factor):
+        # Adjust pan so the COI marker stays fixed on screen while everything
+        # else zooms around it.
+        coi_x, coi_y = self.coi_au
+        self.pan_x += coi_x * self.scale * (1 - factor)
+        self.pan_y += coi_y * self.scale * (1 - factor)
         self.scale *= factor
-        self.pan_x *= factor
-        self.pan_y *= factor
 
     def _update_help_visibility(self):
         if self.help_label:
@@ -808,6 +890,11 @@ class OrreryWidget(Widget):
         cx = self.width / 2 + self.pan_x
         cy = self.height / 2 + self.pan_y
         return cx + x_au * self.scale, cy + y_au * self.scale
+
+    def screen_to_world(self, sx, sy):
+        cx = self.width / 2 + self.pan_x
+        cy = self.height / 2 + self.pan_y
+        return (sx - cx) / self.scale, (sy - cy) / self.scale
 
     # -- Image helpers -----------------------------------------------------
 
@@ -916,6 +1003,8 @@ class OrreryWidget(Widget):
         if not self.paused:
             self.sim_time += TimeDelta(dt * self.time_factor, format="sec")
             self._compute_positions()
+        if self._locked_body:
+            self._update_coi_lock()
         self._draw()
         self._update_info()
 
@@ -949,6 +1038,7 @@ class OrreryWidget(Widget):
                     for moon in moons:
                         self._draw_body(moon)
 
+            self._draw_coi_marker()
             self._draw_info_overlay()
 
     def _draw_orbits(self):
@@ -1010,9 +1100,17 @@ class OrreryWidget(Widget):
         Ellipse(pos=(sx - px, sy - px), size=(px * 2, px * 2))
         self._draw_label(name, sx + px + 4, sy - 6, body["color"])
 
+    def _draw_coi_marker(self):
+        """Draw the Centre of Interest '+' marker in screen space."""
+        sx, sy = self.world_to_screen(*self.coi_au)
+        arm = COI_ARM_PX
+        Color(1, 1, 1, 0.9)
+        Line(points=[sx - arm, sy, sx + arm, sy], width=1.5)
+        Line(points=[sx, sy - arm, sx, sy + arm], width=1.5)
+
     def _draw_label(self, text, x, y, color):
         from kivy.core.text import Label as CoreLabel
-        cl = CoreLabel(text=text, font_size=dp(11))
+        cl = CoreLabel(text=text, font_size=dp(17))
         cl.refresh()
         t = cl.texture
         r, g, b = color
@@ -1080,17 +1178,17 @@ class OrreryWidget(Widget):
             info_lines.append("Orbital velocity: N/A")
 
         # Pre-render to measure sizes
-        title_cl = CoreLabel(text=name, font_size=dp(15), bold=True)
+        title_cl = CoreLabel(text=name, font_size=dp(23), bold=True)
         title_cl.refresh()
         title_t = title_cl.texture
 
-        hint_cl = CoreLabel(text="(click to close)", font_size=dp(10), italic=True)
+        hint_cl = CoreLabel(text="(click to close)", font_size=dp(15), italic=True)
         hint_cl.refresh()
         hint_t = hint_cl.texture
 
         line_ts = []
         for line in info_lines:
-            cl = CoreLabel(text=line, font_size=dp(12))
+            cl = CoreLabel(text=line, font_size=dp(18))
             cl.refresh()
             line_ts.append(cl.texture)
 
@@ -1160,7 +1258,7 @@ class OrreryApp(App):
             halign="right",
             valign="middle",
             color=(0.8, 0.8, 0.8, 1),
-            font_size=dp(13),
+            font_size=dp(20),
         )
         info_label.bind(size=info_label.setter("text_size"))
 
@@ -1173,7 +1271,7 @@ class OrreryApp(App):
             halign="left",
             valign="top",
             color=(0.9, 0.9, 0.9, 1),
-            font_size=dp(14),
+            font_size=dp(21),
         )
         help_label.bind(size=help_label.setter("text_size"))
 
