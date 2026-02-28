@@ -20,7 +20,7 @@ from kivy.graphics import Color, Ellipse, Line, Rectangle, RoundedRectangle
 from kivy.metrics import dp
 
 from simulation import (
-    Simulation,
+    Simulation, xy,
     PLANETS, ASTEROIDS, MINOR_PLANETS, MOONS, MOON_PARENT, BODY_INFO,
     AU_KM, AU_M,
 )
@@ -113,8 +113,8 @@ class OrreryWidget(Widget):
             self._locked_body = "Earth"
             self._locked_target_rx = 0.5
             self._locked_target_ry = 0.5
-            self.coi_au = self.sim.positions["Earth"]
-            ex, ey = self.sim.positions["Earth"]
+            self.coi_au = xy(self.sim.positions["Earth"])
+            ex, ey = self.coi_au
             self.pan_x = -ex * self.scale
             self.pan_y = -ey * self.scale
 
@@ -250,7 +250,7 @@ class OrreryWidget(Widget):
             name = body["name"]
             if name not in self.sim.positions:
                 continue
-            sx, sy = self.world_to_screen(*self.sim.positions[name])
+            sx, sy = self.world_to_screen(*xy(self.sim.positions[name]))
             radius_km = body.get("radius_km", 0)
             min_px = body.get("min_px", 2)
             px = max(radius_km / AU_KM * self.scale, min_px) if radius_km > 0 else min_px
@@ -286,7 +286,7 @@ class OrreryWidget(Widget):
         if name not in self.sim.positions:
             return
         self._locked_body = name
-        self.coi_au = self.sim.positions[name]
+        self.coi_au = xy(self.sim.positions[name])
         self._locked_target_rx = 0.5
         self._locked_target_ry = 0.5
 
@@ -306,7 +306,7 @@ class OrreryWidget(Widget):
             name = body["name"]
             if name not in self.sim.positions:
                 continue
-            sx, sy = self.world_to_screen(*self.sim.positions[name])
+            sx, sy = self.world_to_screen(*xy(self.sim.positions[name]))
             radius_km = body.get("radius_km", 0)
             min_px = body.get("min_px", 2)
             px = max(radius_km / AU_KM * self.scale, min_px) if radius_km > 0 else min_px
@@ -319,7 +319,7 @@ class OrreryWidget(Widget):
             self._locked_body = best_name
             # Snap COI to body centre; record its current screen position as
             # a fraction of widget size so it remains valid after any resize.
-            self.coi_au = self.sim.positions[best_name]
+            self.coi_au = xy(self.sim.positions[best_name])
             sx, sy = self.world_to_screen(*self.coi_au)
             self._locked_target_rx = sx / self.width  if self.width  > 0 else 0.5
             self._locked_target_ry = sy / self.height if self.height > 0 else 0.5
@@ -329,7 +329,7 @@ class OrreryWidget(Widget):
         if self._locked_body not in self.sim.positions:
             self._locked_body = None
             return
-        self.coi_au = self.sim.positions[self._locked_body]
+        self.coi_au = xy(self.sim.positions[self._locked_body])
         coi_x, coi_y = self.coi_au
         self.pan_x = self._locked_target_rx * self.width  - self.width  / 2 - coi_x * self.scale
         self.pan_y = self._locked_target_ry * self.height - self.height / 2 - coi_y * self.scale
@@ -472,8 +472,8 @@ class OrreryWidget(Widget):
             r, g, b = body["color"]
             Color(r, g, b, 0.25)
             pts = []
-            for x_au, y_au in path:
-                pts.extend(self.world_to_screen(x_au, y_au))
+            for pt in path:
+                pts.extend(self.world_to_screen(*xy(pt)))
             Line(points=pts, width=1.1)
 
         for body in ASTEROIDS + MINOR_PLANETS:
@@ -483,14 +483,13 @@ class OrreryWidget(Widget):
             r, g, b = body["color"]
             Color(r, g, b, 0.2)
             pts = []
-            for x_au, y_au in path:
-                pts.extend(self.world_to_screen(x_au, y_au))
+            for pt in path:
+                pts.extend(self.world_to_screen(*xy(pt)))
             Line(points=pts, width=1.1, dash_length=4, dash_offset=4)
 
     def _draw_moon_orbits(self, planet_name):
         """Draw orbit rings for all moons of planet_name, centered on the planet."""
-        planet_pos = self.sim.positions.get(planet_name, (0.0, 0.0))
-        p_sx, p_sy = self.world_to_screen(*planet_pos)
+        p_sx, p_sy = self.world_to_screen(*xy(self.sim.positions[planet_name]))
         for moon in MOONS[planet_name]:
             path = self.sim.moon_orbit_paths.get(moon["name"], [])
             if len(path) < 2:
@@ -498,7 +497,8 @@ class OrreryWidget(Widget):
             r, g, b = moon["color"]
             Color(r, g, b, 0.35)
             pts = []
-            for dx_au, dy_au in path:
+            for offset in path:
+                dx_au, dy_au = xy(offset)
                 pts.append(p_sx + dx_au * self.scale)
                 pts.append(p_sy + dy_au * self.scale)
             Line(points=pts, width=1)
@@ -507,7 +507,7 @@ class OrreryWidget(Widget):
         name = body["name"]
         if name not in self.sim.positions:
             return
-        sx, sy = self.world_to_screen(*self.sim.positions[name])
+        sx, sy = self.world_to_screen(*xy(self.sim.positions[name]))
 
         radius_km = body.get("radius_km", 0)
         min_px = body.get("min_px", 2)
@@ -644,7 +644,8 @@ class OrreryWidget(Widget):
 
         name = self.selected_body
         info = BODY_INFO.get(name, {})
-        pos_au = self.sim.positions.get(name, (0.0, 0.0))
+        pos = self.sim.positions.get(name)
+        pos_au = xy(pos) if pos is not None else (0.0, 0.0)
         dist_au = math.hypot(*pos_au)
         parent = MOON_PARENT.get(name)
 

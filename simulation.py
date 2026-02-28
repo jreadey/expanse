@@ -6,7 +6,7 @@ from datetime import datetime
 import astropy.units as u
 from astropy.constants import au as _au
 from astropy.time import Time, TimeDelta
-from astropy.coordinates import get_body_barycentric, solar_system_ephemeris
+from astropy.coordinates import CartesianRepresentation, get_body_barycentric, solar_system_ephemeris
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +545,11 @@ _BODY_RADIUS_M = {
 BODY_MIN_DIST_SQ_M = {name: r * r for name, r in _BODY_RADIUS_M.items()}
 
 
+def xy(pos):
+    """Project a CartesianRepresentation to a plain (x_au, y_au) float tuple."""
+    return pos.x.to(u.AU).value, pos.y.to(u.AU).value
+
+
 # ---------------------------------------------------------------------------
 # Keplerian propagation helpers
 # ---------------------------------------------------------------------------
@@ -561,10 +566,10 @@ def solve_kepler(M, e, tol=1e-8):
 
 
 def kepler_pos(a, e, i_deg, Omega_deg, omega_deg, M0_deg, epoch_jd, period_y, jd):
-    """Return (x, y) ecliptic-plane coordinates in AU via Keplerian propagation.
+    """Return a CartesianRepresentation (x, y, z) in AU via Keplerian propagation.
 
     For planets/asteroids the origin is the Sun; for moons the origin is the
-    parent planet.  The returned offsets are in AU.
+    parent planet.  All components are in AU.
     """
     period_days = period_y * 365.25
     n = 2.0 * math.pi / period_days
@@ -582,11 +587,12 @@ def kepler_pos(a, e, i_deg, Omega_deg, omega_deg, M0_deg, epoch_jd, period_y, jd
 
     cos_Om, sin_Om = math.cos(Om), math.sin(Om)
     cos_wnu, sin_wnu = math.cos(w + nu), math.sin(w + nu)
-    cos_i = math.cos(i)
+    cos_i, sin_i = math.cos(i), math.sin(i)
 
     x = r * (cos_Om * cos_wnu - sin_Om * sin_wnu * cos_i)
     y = r * (sin_Om * cos_wnu + cos_Om * sin_wnu * cos_i)
-    return x, y
+    z = r * sin_i * sin_wnu
+    return CartesianRepresentation(x * u.AU, y * u.AU, z * u.AU)
 
 
 # Keep the old name as an alias so nothing else breaks
@@ -594,31 +600,29 @@ kepler_pos_heliocentric = kepler_pos
 
 
 def kepler_orbit_points(body, n_points=360):
-    """Return list of (x, y) points tracing one full closed orbit."""
+    """Return list of CartesianRepresentation points tracing one full closed orbit."""
     period_days = body["period_y"] * 365.25
     pts = []
     for k in range(n_points):
         jd = body["epoch_jd"] + (k / n_points) * period_days
-        x, y = kepler_pos(body["a"], body["e"], body["i"], body["Omega"],
-                          body["omega"], body["M0"], body["epoch_jd"],
-                          body["period_y"], jd)
-        pts.append((x, y))
+        pts.append(kepler_pos(body["a"], body["e"], body["i"], body["Omega"],
+                              body["omega"], body["M0"], body["epoch_jd"],
+                              body["period_y"], jd))
     if pts:
         pts.append(pts[0])
     return pts
 
 
 def moon_orbit_points(moon, n_points=120):
-    """Return list of (dx, dy) offsets in AU tracing one full moon orbit."""
+    """Return list of CartesianRepresentation offsets in AU tracing one full moon orbit."""
     period_y = moon["period_d"] / 365.25
     a_au = moon["a_km"] / AU_KM
     pts = []
     for k in range(n_points):
         jd = moon["epoch_jd"] + (k / n_points) * moon["period_d"]
-        dx, dy = kepler_pos(a_au, moon["e"], moon["i"], moon["Omega"],
-                            moon["omega"], moon["M0"], moon["epoch_jd"],
-                            period_y, jd)
-        pts.append((dx, dy))
+        pts.append(kepler_pos(a_au, moon["e"], moon["i"], moon["Omega"],
+                              moon["omega"], moon["M0"], moon["epoch_jd"],
+                              period_y, jd))
     if pts:
         pts.append(pts[0])
     return pts
@@ -631,16 +635,19 @@ def moon_orbit_points(moon, n_points=120):
 class Simulation:
     """All orbital mechanics and ship physics, independent of any GUI framework."""
 
-    def __init__(self):
-        self.sim_time = Time(datetime.utcnow(), scale="utc")
+    def __init__(self, sim_time=None, paused=False):
+        if sim_time:
+            self.sim_time = sim_time
+        else:
+            self.sim_time = Time(datetime.utcnow(), scale="utc")
         self.time_factor = 1.0
-        self.paused = False
+        self.paused = paused
         self._crashed = False
         self._crash_body = None
         self._last_computed_jd = 0.0
 
-        # Body positions: name -> (x_au, y_au)  — includes moons (heliocentric)
-        self.positions = {"Sun": (0.0, 0.0)}
+        # Body positions: name -> CartesianRepresentation (heliocentric AU)
+        self.positions = {"Sun": CartesianRepresentation(0.0, 0.0, 0.0, unit=u.AU)}
         # Estimated body velocities (m/s) from position diffs, updated each compute cycle
         self.body_vel_ms = {}
         # Precomputed orbit paths
@@ -670,9 +677,11 @@ class Simulation:
                     try:
                         sun_pos  = get_body_barycentric("sun", t)
                         body_pos = get_body_barycentric(name, t)
-                        x = body_pos.x.to(u.AU).value - sun_pos.x.to(u.AU).value
-                        y = body_pos.y.to(u.AU).value - sun_pos.y.to(u.AU).value
-                        points.append((x, y))
+                        points.append(CartesianRepresentation(
+                            (body_pos.x - sun_pos.x).to(u.AU),
+                            (body_pos.y - sun_pos.y).to(u.AU),
+                            (body_pos.z - sun_pos.z).to(u.AU),
+                        ))
                     except Exception:
                         pass
                 if points:
@@ -701,21 +710,25 @@ class Simulation:
         with solar_system_ephemeris.set("builtin"):
             try:
                 sun_pos = get_body_barycentric("sun", self.sim_time)
-                sun_x = sun_pos.x.to(u.AU).value
-                sun_y = sun_pos.y.to(u.AU).value
             except Exception:
-                sun_x, sun_y = 0.0, 0.0
+                sun_pos = None
 
-            self.positions["Sun"] = (0.0, 0.0)
+            self.positions["Sun"] = CartesianRepresentation(0.0, 0.0, 0.0, unit=u.AU)
             for body in PLANETS[1:]:
                 try:
                     pos = get_body_barycentric(body["name"].lower(), self.sim_time)
-                    self.positions[body["name"]] = (
-                        pos.x.to(u.AU).value - sun_x,
-                        pos.y.to(u.AU).value - sun_y,
-                    )
+                    if sun_pos is not None:
+                        self.positions[body["name"]] = CartesianRepresentation(
+                            (pos.x - sun_pos.x).to(u.AU),
+                            (pos.y - sun_pos.y).to(u.AU),
+                            (pos.z - sun_pos.z).to(u.AU),
+                        )
+                    else:
+                        self.positions[body["name"]] = CartesianRepresentation(
+                            pos.x.to(u.AU), pos.y.to(u.AU), pos.z.to(u.AU),
+                        )
                 except Exception:
-                    self.positions[body["name"]] = (0.0, 0.0)
+                    self.positions[body["name"]] = CartesianRepresentation(0.0, 0.0, 0.0, unit=u.AU)
 
         for body in ASTEROIDS + MINOR_PLANETS:
             self.positions[body["name"]] = kepler_pos(
@@ -723,22 +736,27 @@ class Simulation:
                 body["M0"], body["epoch_jd"], body["period_y"], jd)
 
         # Moon positions = parent heliocentric + Keplerian offset from parent
+        _zero = CartesianRepresentation(0.0, 0.0, 0.0, unit=u.AU)
         for planet_name, moons in MOONS.items():
-            px, py = self.positions.get(planet_name, (0.0, 0.0))
+            parent_pos = self.positions.get(planet_name, _zero)
             for moon in moons:
                 a_au = moon["a_km"] / AU_KM
-                dx, dy = kepler_pos(
+                offset = kepler_pos(
                     a_au, moon["e"], moon["i"], moon["Omega"], moon["omega"],
                     moon["M0"], moon["epoch_jd"], moon["period_d"] / 365.25, jd)
-                self.positions[moon["name"]] = (px + dx, py + dy)
+                self.positions[moon["name"]] = CartesianRepresentation(
+                    parent_pos.x + offset.x,
+                    parent_pos.y + offset.y,
+                    parent_pos.z + offset.z,
+                )
 
         # Estimate body velocities from position change since last compute.
         dt_s = (jd - prev_jd) * 86400.0
         if dt_s > 0.0 and prev_pos:
-            for name, new_xy in self.positions.items():
+            for name, new_pos in self.positions.items():
                 if name in prev_pos:
-                    dx_m = (new_xy[0] - prev_pos[name][0]) * AU_M
-                    dy_m = (new_xy[1] - prev_pos[name][1]) * AU_M
+                    dx_m = (new_pos.x - prev_pos[name].x).to(u.m).value
+                    dy_m = (new_pos.y - prev_pos[name].y).to(u.m).value
                     self.body_vel_ms[name] = (dx_m / dt_s, dy_m / dt_s)
 
     # -- Ship --------------------------------------------------------------
@@ -746,7 +764,8 @@ class Simulation:
     def init_ship(self):
         """Place the ship 200 km above Earth, nose pointing north, engine off."""
         defn = SHIPS[0]
-        ex, ey = self.positions.get("Earth", (1.0, 0.0))
+        earth_pos = self.positions.get("Earth")
+        ex, ey = xy(earth_pos) if earth_pos is not None else (1.0, 0.0)
         dist = math.hypot(ex, ey)
         ux, uy = (ex / dist, ey / dist) if dist > 0 else (1.0, 0.0)
         # Offset from Earth centre: Earth radius + 200 km, in AU
@@ -801,7 +820,8 @@ class Simulation:
 
         # Cache body positions in metres once per frame
         body_pos_m = {
-            name: (self.positions[name][0] * AU_M, self.positions[name][1] * AU_M)
+            name: (self.positions[name].x.to(u.m).value,
+                   self.positions[name].y.to(u.m).value)
             for name in GRAVITY_GM
             if name in self.positions
         }
