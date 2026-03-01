@@ -100,6 +100,11 @@ class OrreryWidget(Widget):
         self._image_cache = {}
         self.show_ship_overlay = True
 
+        # Ship overlay slider state
+        self._ship_overlay_rect  = None  # full panel bounding rect
+        self._ship_slider_rects = {}   # {"thrust": (x, y, w, h), ...} — track hit rects
+        self._dragging_slider = None   # name of slider currently being dragged
+
         # Celestial mechanics
         self.sim = Simulation()
 
@@ -145,14 +150,11 @@ class OrreryWidget(Widget):
             self._update_help_visibility()
         elif key_name == "r":
             self.scale = DEFAULT_SCALE
-            self.pan_x = 0.0
-            self.pan_y = 0.0
-            self.coi_au = (0.0, 0.0)
-            self._locked_body = None
             self.sim._crashed = False
             self.sim._crash_body = None
             self.sim.init_ship()
             self.sim.paused = False
+            self._lock_to("Earth")
         elif key_name == "f11":
             self._fullscreen = not self._fullscreen
             Window.fullscreen = "auto" if self._fullscreen else False
@@ -178,6 +180,20 @@ class OrreryWidget(Widget):
             self.selected_body = None
             return True
 
+        # Ship overlay — consume any touch that starts inside the panel so it
+        # never falls through to pan/COI logic.  Only start a slider drag when
+        # the touch actually lands on a slider track.
+        if (self.show_ship_overlay and self.sim.ship
+                and self._ship_overlay_rect
+                and self._point_in_rect(touch.pos, self._ship_overlay_rect)):
+            for sname, rect in self._ship_slider_rects.items():
+                if self._point_in_rect(touch.pos, rect):
+                    self._dragging_slider = sname
+                    self._apply_slider_touch(sname, touch.x, rect)
+                    break
+            touch.grab(self)
+            return True
+
         # Only begin a drag when the touch is on or near the COI marker
         coi_sx, coi_sy = self.world_to_screen(*self.coi_au)
         coi_dist = math.hypot(touch.x - coi_sx, touch.y - coi_sy)
@@ -198,6 +214,11 @@ class OrreryWidget(Widget):
     def on_touch_move(self, touch):
         if touch.grab_current is not self:
             return False
+        if self._dragging_slider:
+            rect = self._ship_slider_rects.get(self._dragging_slider)
+            if rect:
+                self._apply_slider_touch(self._dragging_slider, touch.x, rect)
+            return True
         if self._last_touch:
             if not self._dragging and self._drag_origin:
                 if math.hypot(touch.x - self._drag_origin[0],
@@ -224,7 +245,9 @@ class OrreryWidget(Widget):
     def on_touch_up(self, touch):
         if touch.grab_current is self:
             touch.ungrab(self)
-            if not self._dragging and self._drag_origin:
+            if self._dragging_slider:
+                self._dragging_slider = None
+            elif not self._dragging and self._drag_origin:
                 self._handle_click(touch.pos)
             elif self._dragging and self._drag_coi:
                 self._check_coi_lock()
@@ -526,8 +549,8 @@ class OrreryWidget(Widget):
     def _draw_ship(self):
         """Draw the ship as a narrow isoceles triangle (30° apex angle)."""
         ship = self.sim.ship
-        defn = ship["def"]
-        sx, sy = self.world_to_screen(*ship["pos_au"])
+        defn = ship.defn
+        sx, sy = self.world_to_screen(*xy(ship.pos))
 
         L = defn["min_px"]                        # nose-to-base length in pixels
         hw = L * math.tan(math.radians(15))       # half-width at base (30° apex → 15° half-angle)
@@ -541,7 +564,7 @@ class OrreryWidget(Widget):
         ]
 
         # Rotate clockwise by orientation_deg from north in a y-up coordinate system
-        angle = math.radians(ship["orientation_deg"])
+        angle = math.radians(ship.orientation)
         cos_a, sin_a = math.cos(angle), math.sin(angle)
         pts = []
         for lx, ly in local:
@@ -554,6 +577,21 @@ class OrreryWidget(Widget):
         Line(points=pts, width=1.5)
         self._draw_label(defn["name"], sx + hw + 4, sy - 6, defn["color"])
 
+    def _apply_slider_touch(self, name, tx, rect):
+        """Map a touch x position onto the slider's value range and update the ship."""
+        rx, ry, rw, rh = rect
+        frac = max(0.0, min(1.0, (tx - rx) / rw))
+        ship = self.sim.ship
+        if name == "thrust":
+            try:
+                ship.set_thrust(frac * 100.0)
+            except ValueError:
+                pass
+        elif name == "orientation":
+            ship.set_orientation(frac * 359.9)
+        elif name == "elevation":
+            ship.set_orientation(ship.orientation, elevation=(frac - 0.5) * 180.0)
+
     def _draw_ship_overlay(self):
         """Bottom-right panel showing live ship state."""
         if not self.show_ship_overlay:
@@ -561,19 +599,20 @@ class OrreryWidget(Widget):
         from kivy.core.text import Label as CoreLabel
 
         ship = self.sim.ship
-        defn = ship["def"]
+        defn = ship.defn
 
         ref_name = self._locked_body if self._locked_body else "Sun"
         ref_vel  = self.sim.body_vel_ms.get(ref_name, (0.0, 0.0))
-        rel_vx   = ship["vel_ms"][0] - ref_vel[0]
-        rel_vy   = ship["vel_ms"][1] - ref_vel[1]
-        speed_ms = math.hypot(rel_vx, rel_vy)
-        orientation = ship["orientation_deg"] % 360
-        accel_g = 0.0
+        rel_vx   = ship.vel[0] - ref_vel[0]
+        rel_vy   = ship.vel[1] - ref_vel[1]
+        speed_ms      = math.hypot(rel_vx, rel_vy)
+        total_mass_kg = (defn["dry_mass_t"] + ship.fuel) * 1000.0
+        thrust_N      = ship.thrust / 100.0 * defn["max_thrust_N"]
+        accel_g       = (thrust_N / total_mass_kg) / 9.80665 if total_mass_kg > 0 else 0.0
 
         lines = [
             f"Speed:        {speed_ms:,.1f} m/s  (re. {ref_name})",
-            f"Orientation:  {orientation:.1f}\u00b0",
+            f"Orientation:  {ship.orientation:.1f}\u00b0 / {ship.elevation:.1f}\u00b0",
             f"Acceleration: {accel_g:.2f} g",
         ]
 
@@ -587,22 +626,53 @@ class OrreryWidget(Widget):
             cl.refresh()
             line_ts.append(cl.texture)
 
-        PAD, LINE_GAP, GAP = 14, 3, 6
-        OVERLAY_W = 400
+        PAD        = 14
+        LINE_GAP   = 3
+        GAP        = 6
+        OVERLAY_W  = 720
+        LEFT_W     = 280   # info text column
+        COL_SEP    = 16    # gap (incl. separator line) between each column pair
+        LABEL_W    = 82    # slider label column
+        VAL_W      = 58    # slider value column
+        FUEL_COL_W = 64    # fuel indicator column
+        TRACK_W    = OVERLAY_W - 2*PAD - LEFT_W - COL_SEP - LABEL_W - VAL_W - COL_SEP - FUEL_COL_W
+        TRACK_T    = 5
+        THUMB_R    = 7
+        SLIDER_H   = 28
 
-        total_h = PAD + title_t.height + GAP
-        for t in line_ts:
-            total_h += t.height + LINE_GAP
-        total_h += PAD
+        # Battery icon dimensions
+        BATT_W      = 30
+        NUB_W       = 16
+        NUB_H       = 6
+        BATT_BORDER = 2
+
+        left_h  = title_t.height + GAP + sum(t.height + LINE_GAP for t in line_ts)
+        right_h = 3 * SLIDER_H
+        total_h = max(left_h, right_h) + 2 * PAD
 
         ox = self.width - OVERLAY_W - 20
         oy = 20
+
+        # Column x origins
+        slider_x = ox + PAD + LEFT_W + COL_SEP
+        track_x  = slider_x + LABEL_W
+        fuel_x   = slider_x + LABEL_W + TRACK_W + VAL_W + COL_SEP
+
+        self._ship_overlay_rect = (ox, oy, OVERLAY_W, total_h)
 
         Color(0.07, 0.07, 0.12, 0.93)
         RoundedRectangle(pos=(ox, oy), size=(OVERLAY_W, total_h), radius=[10])
         Color(0.3, 0.3, 0.45, 0.6)
         Line(rounded_rectangle=(ox, oy, OVERLAY_W, total_h, 10), width=1)
 
+        # Vertical separators
+        Color(0.3, 0.3, 0.45, 0.7)
+        sep1_x = ox + PAD + LEFT_W + COL_SEP // 2
+        Line(points=[sep1_x, oy + PAD, sep1_x, oy + total_h - PAD], width=1)
+        sep2_x = fuel_x - COL_SEP // 2
+        Line(points=[sep2_x, oy + PAD, sep2_x, oy + total_h - PAD], width=1)
+
+        # Left column: title + info lines
         draw_y = oy + total_h - PAD
         draw_y -= title_t.height
         r, g, b = defn["color"]
@@ -615,6 +685,113 @@ class OrreryWidget(Widget):
             Color(0.82, 0.82, 0.88, 1)
             Rectangle(texture=t, pos=(ox + PAD, draw_y), size=t.size)
             draw_y -= LINE_GAP
+
+        # Middle column: sliders, top-aligned
+        slider_defs = [
+            ("thrust",      "Thrust",
+             ship.thrust / 100.0,
+             f"{ship.thrust:.0f}%"),
+            ("orientation", "Heading",
+             ship.orientation / 359.9,
+             f"{ship.orientation:.1f}\u00b0"),
+            ("elevation",   "Elevation",
+             (ship.elevation + 90.0) / 180.0,
+             f"{ship.elevation:.1f}\u00b0"),
+        ]
+
+        draw_y = oy + total_h - PAD
+        self._ship_slider_rects = {}
+        for sname, slabel, frac, sval in slider_defs:
+            row_cy = draw_y - SLIDER_H // 2
+            draw_y -= SLIDER_H
+
+            self._ship_slider_rects[sname] = (
+                track_x, row_cy - THUMB_R - 2, TRACK_W, (THUMB_R + 2) * 2
+            )
+
+            lbl_cl = CoreLabel(text=slabel, font_size=dp(16))
+            lbl_cl.refresh()
+            lbl_t = lbl_cl.texture
+            Color(0.7, 0.7, 0.8, 1)
+            Rectangle(texture=lbl_t,
+                      pos=(slider_x, row_cy - lbl_t.height // 2),
+                      size=lbl_t.size)
+
+            track_y = row_cy - TRACK_T // 2
+            Color(0.2, 0.2, 0.3, 1)
+            RoundedRectangle(pos=(track_x, track_y),
+                             size=(TRACK_W, TRACK_T), radius=[3])
+
+            if frac > 0:
+                Color(0.35, 0.55, 0.95, 0.85)
+                RoundedRectangle(pos=(track_x, track_y),
+                                 size=(TRACK_W * frac, TRACK_T), radius=[3])
+
+            thumb_x = track_x + TRACK_W * frac
+            Color(0.85, 0.92, 1.0, 1)
+            Ellipse(pos=(thumb_x - THUMB_R, row_cy - THUMB_R),
+                    size=(THUMB_R * 2, THUMB_R * 2))
+
+            val_cl = CoreLabel(text=sval, font_size=dp(16))
+            val_cl.refresh()
+            val_t = val_cl.texture
+            Color(0.82, 0.82, 0.88, 1)
+            Rectangle(texture=val_t,
+                      pos=(track_x + TRACK_W + 8, row_cy - val_t.height // 2),
+                      size=val_t.size)
+
+        # Right column: fuel battery icon, vertically centred
+        fuel_pct = max(0.0, min(100.0,
+                       ship.fuel / defn["max_fuel_t"] * 100.0))
+
+        pct_cl = CoreLabel(text=f"{fuel_pct:.0f}%", font_size=dp(14))
+        pct_cl.refresh()
+        pct_t  = pct_cl.texture
+
+        # Lay out the block: nub (top) → body → gap → pct text (bottom)
+        avail_h   = total_h - 2 * PAD
+        BATT_H    = max(20, avail_h - NUB_H - 4 - pct_t.height)
+        block_h   = NUB_H + BATT_H + 4 + pct_t.height
+        block_bot = oy + PAD + (avail_h - block_h) // 2   # bottom of pct text
+        batt_y    = block_bot + 4 + pct_t.height           # bottom of battery body
+        nub_y     = batt_y + BATT_H                        # bottom of nub
+        batt_x    = fuel_x + (FUEL_COL_W - BATT_W) // 2
+        nub_x     = fuel_x + (FUEL_COL_W - NUB_W) // 2
+
+        # Terminal nub
+        Color(0.45, 0.45, 0.60, 0.9)
+        RoundedRectangle(pos=(nub_x, nub_y), size=(NUB_W, NUB_H), radius=[2])
+
+        # Battery outline
+        Color(0.45, 0.45, 0.60, 0.9)
+        Line(rounded_rectangle=(batt_x, batt_y, BATT_W, BATT_H, 3),
+             width=BATT_BORDER)
+
+        # Fill colour: green → amber → red
+        if fuel_pct > 50:
+            fc = (0.15, 0.80, 0.25, 0.9)
+        elif fuel_pct > 20:
+            fc = (0.95, 0.75, 0.05, 0.9)
+        else:
+            fc = (0.90, 0.18, 0.18, 0.9)
+
+        inner_margin = BATT_BORDER + 2
+        inner_x = batt_x + inner_margin
+        inner_w = BATT_W - 2 * inner_margin
+        fill_h  = int((BATT_H - 2 * inner_margin) * fuel_pct / 100.0)
+        if fill_h > 0:
+            Color(*fc)
+            RoundedRectangle(
+                pos=(inner_x, batt_y + inner_margin),
+                size=(inner_w, fill_h),
+                radius=[2],
+            )
+
+        # Percentage text, centred below the battery
+        Color(0.82, 0.82, 0.88, 1)
+        Rectangle(texture=pct_t,
+                  pos=(fuel_x + (FUEL_COL_W - pct_t.width) // 2, block_bot),
+                  size=pct_t.size)
 
     def _draw_coi_marker(self):
         """Draw the Centre of Interest '+' marker in screen space."""

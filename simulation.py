@@ -1,12 +1,16 @@
 """Solar system body data, orbital mechanics helpers, and Simulation class."""
 
 import math
+import warnings
 from datetime import datetime
 
 import astropy.units as u
 from astropy.constants import au as _au
 from astropy.time import Time, TimeDelta
 from astropy.coordinates import CartesianRepresentation, get_body_barycentric, solar_system_ephemeris
+from erfa import ErfaWarning
+
+warnings.filterwarnings("ignore", category=ErfaWarning)
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +505,7 @@ SHIPS = [
         "dry_mass_t": 52,         # metric tons
         "max_fuel_t": 1500,       # metric tons
         "max_thrust_N": 15e6,     # Newtons (15 MN)
+        "isp_s": 350,             # specific impulse (s) — chemical (Raptor-class)
         "color": (0.85, 0.95, 1.0),
         "min_px": 20,             # drawn nose-to-base length in pixels
     },
@@ -629,18 +634,115 @@ def moon_orbit_points(moon, n_points=120):
 
 
 # ---------------------------------------------------------------------------
+# Ship
+# ---------------------------------------------------------------------------
+
+class Ship:
+    """A player-controlled spacecraft."""
+
+    def __init__(self, defn, pos_au, vel_ms):
+        self.defn = defn               # ship definition dict (from SHIPS)
+        self.pos  = pos_au             # CartesianRepresentation (heliocentric AU)
+        self.vel  = vel_ms             # (vx_ms, vy_ms, vz_ms) — updated each physics tick
+        self._orientation_deg = 0.0   # degrees CW from north (in the x-y plane)
+        self._elevation_deg   = 0.0   # degrees above the x-y plane (-90 to +90)
+        self._thrust_pct      = 0.0   # throttle 0–100 %
+        self._fuel_t          = defn["max_fuel_t"]  # metric tons remaining
+        self._sim             = None  # back-reference set by Simulation.init_ship()
+
+    @property
+    def position(self):
+        """Current position as a CartesianRepresentation in AU (heliocentric)."""
+        return self.pos
+    
+    @property
+    def velocity(self):
+        """Current velocity as a (vx_ms, vy_ms, vz_ms) tuple in m/s."""
+        return self.vel
+    
+    @property
+    def orientation(self):
+        """Orientation in degrees clockwise from north (in the x-y ecliptic plane)."""
+        return self._orientation_deg
+
+    @property
+    def elevation(self):
+        """Elevation above the x-y ecliptic plane in degrees (-90 to +90)."""
+        return self._elevation_deg
+
+    @property
+    def thrust(self):
+        """Throttle level as a percentage (0–100)."""
+        return self._thrust_pct
+
+    @property
+    def fuel(self):
+        """Remaining fuel in metric tons."""
+        return self._fuel_t
+
+    def set_orientation(self, degrees, elevation=None):
+        """Set orientation in degrees CW from north (x-y plane).
+
+        If *elevation* is provided it is clamped to [-90, +90] degrees.
+        If omitted, the current elevation is unchanged.
+        """
+        self._orientation_deg = degrees % 360
+        if elevation is not None:
+            self._elevation_deg = max(-90.0, min(90.0, float(elevation)))
+
+    def set_thrust(self, pct):
+        """Set throttle level, clamped to 0–100 %.
+
+        Raises ValueError if pct > 0 and the tank is empty.
+        """
+        if pct > 0.0 and self._fuel_t <= 0.0:
+            raise ValueError("Cannot set thrust: fuel is empty")
+        self._thrust_pct = max(0.0, min(100.0, pct))
+
+    def dist(self, name):
+        """Return distance in AU between the ship and *name*.
+
+        Raises ValueError if the body name is not recognised.
+        """
+        if self._sim is None:
+            raise RuntimeError("Ship has no Simulation reference")
+        body_pos = self._sim.positions.get(name)
+        if body_pos is None:
+            raise ValueError(f"Unknown body: {name!r}")
+        dx = (self.pos.x - body_pos.x).to(u.AU).value
+        dy = (self.pos.y - body_pos.y).to(u.AU).value
+        dz = (self.pos.z - body_pos.z).to(u.AU).value
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    def relative_velocity(self, name):
+        """Return speed in m/s of the ship relative to *name*.
+
+        Raises ValueError if the body name is not recognised.
+        """
+        if self._sim is None:
+            raise RuntimeError("Ship has no Simulation reference")
+        if name not in self._sim.positions:
+            raise ValueError(f"Unknown body: {name!r}")
+        bv = self._sim.body_vel_ms.get(name, (0.0, 0.0))
+        dvx = self.vel[0] - bv[0]
+        dvy = self.vel[1] - bv[1]
+        dvz = self.vel[2] - (bv[2] if len(bv) > 2 else 0.0)
+        return math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz)
+
+
+# ---------------------------------------------------------------------------
 # Simulation
 # ---------------------------------------------------------------------------
 
 class Simulation:
     """All orbital mechanics and ship physics, independent of any GUI framework."""
 
-    def __init__(self, sim_time=None, paused=False):
+    def __init__(self, sim_time=None, time_factor=1.0, paused=False):
         if sim_time:
             self.sim_time = sim_time
         else:
             self.sim_time = Time(datetime.utcnow(), scale="utc")
-        self.time_factor = 1.0
+        self.time_factor = time_factor
         self.paused = paused
         self._crashed = False
         self._crash_body = None
@@ -654,11 +756,12 @@ class Simulation:
         self.orbit_paths = {}       # planet/asteroid: name -> [(x,y) AU heliocentric]
         self.moon_orbit_paths = {}  # moon: name -> [(dx,dy) AU relative to parent]
 
-        self.ship = {}
+        self.ship = None  # set by init_ship()
 
         self.precompute_orbits()
         self.precompute_moon_orbits()
         self.compute_positions(force=True)
+        self._bootstrap_body_velocities()
         self.init_ship()
 
     # -- Orbit precomputation ----------------------------------------------
@@ -699,9 +802,38 @@ class Simulation:
 
     # -- Position computation ----------------------------------------------
 
+    def _bootstrap_body_velocities(self):
+        """Seed body_vel_ms at startup using a 60-second ephemeris finite-diff.
+
+        compute_positions() derives velocities from successive position snapshots,
+        but its first snapshot only contains the Sun (the initial placeholder), so
+        planet velocities are never populated until the simulation has advanced
+        0.1 JD.  This method fills body_vel_ms with accurate values immediately
+        so that Ship.relative_velocity() is correct from the first frame.
+        """
+        dt_s = 60.0
+        t0 = self.sim_time
+        t1 = t0 + TimeDelta(dt_s, format="sec")
+        with solar_system_ephemeris.set("builtin"):
+            try:
+                sun0 = get_body_barycentric("sun", t0)
+                sun1 = get_body_barycentric("sun", t1)
+            except Exception:
+                return
+            for body in PLANETS[1:]:
+                try:
+                    p0 = get_body_barycentric(body["name"].lower(), t0)
+                    p1 = get_body_barycentric(body["name"].lower(), t1)
+                    dx_m = ((p1.x - p0.x) - (sun1.x - sun0.x)).to(u.m).value
+                    dy_m = ((p1.y - p0.y) - (sun1.y - sun0.y)).to(u.m).value
+                    dz_m = ((p1.z - p0.z) - (sun1.z - sun0.z)).to(u.m).value
+                    self.body_vel_ms[body["name"]] = (dx_m / dt_s, dy_m / dt_s, dz_m / dt_s)
+                except Exception:
+                    pass
+
     def compute_positions(self, force=False):
         jd = self.sim_time.jd
-        if not force and abs(jd - self._last_computed_jd) < 0.1:
+        if not force and abs(jd - self._last_computed_jd) < 0.001:
             return
         prev_jd  = self._last_computed_jd
         prev_pos = dict(self.positions)
@@ -757,7 +889,8 @@ class Simulation:
                 if name in prev_pos:
                     dx_m = (new_pos.x - prev_pos[name].x).to(u.m).value
                     dy_m = (new_pos.y - prev_pos[name].y).to(u.m).value
-                    self.body_vel_ms[name] = (dx_m / dt_s, dy_m / dt_s)
+                    dz_m = (new_pos.z - prev_pos[name].z).to(u.m).value
+                    self.body_vel_ms[name] = (dx_m / dt_s, dy_m / dt_s, dz_m / dt_s)
 
     # -- Ship --------------------------------------------------------------
 
@@ -792,19 +925,28 @@ class Simulation:
             earth1 = get_body_barycentric("Earth", t1)
         vex = ((earth1.x - earth0.x) - (sun1.x - sun0.x)).to(u.m).value / dt_s
         vey = ((earth1.y - earth0.y) - (sun1.y - sun0.y)).to(u.m).value / dt_s
+        vez = ((earth1.z - earth0.z) - (sun1.z - sun0.z)).to(u.m).value / dt_s
 
         # Add circular LEO speed prograde around Earth
         r_ship_m = (6371 + 200) * 1e3
         v_circ   = math.sqrt(GRAVITY_GM["Earth"] / r_ship_m)
 
-        self.ship = {
-            "def": defn,
-            "pos_au": (ex + ux * offset_au, ey + uy * offset_au),
-            "vel_ms": (vex + v_circ * pg_x, vey + v_circ * pg_y),
-            "orientation_deg": 0.0,        # degrees CW from north (up)
-            "fuel_t": defn["max_fuel_t"], # current fuel, metric tons
-            "thrust_pct": 0.0,            # throttle 0–100 %
-        }
+        # Use Earth's actual ICRS z — get_body_barycentric returns equatorial
+        # (ICRS) coordinates; the ecliptic is tilted ~23.4° so Earth's z is
+        # non-zero (~0.134 AU today).  Hardcoding z=0 would place the ship
+        # ~0.134 AU away from Earth in the z direction.
+        ez = earth_pos.z if earth_pos is not None else 0.0 * u.AU
+
+        self.ship = Ship(
+            defn   = defn,
+            pos_au = CartesianRepresentation(
+                (ex + ux * offset_au) * u.AU,
+                (ey + uy * offset_au) * u.AU,
+                ez,
+            ),
+            vel_ms = (vex + v_circ * pg_x, vey + v_circ * pg_y, vez),
+        )
+        self.ship._sim = self
 
     def update_ship_physics(self, sim_dt):
         """Integrate ship motion under gravity using symplectic Euler.
@@ -818,29 +960,73 @@ class Simulation:
         if sim_dt <= 0.0:
             return
 
-        # Cache body positions in metres once per frame
-        body_pos_m = {
-            name: (self.positions[name].x.to(u.m).value,
-                   self.positions[name].y.to(u.m).value)
-            for name in GRAVITY_GM
-            if name in self.positions
-        }
+        # Extrapolate body positions to the start of this tick using their
+        # velocities.  compute_positions() only fires every 0.1 JD (8 640 s),
+        # so self.positions[] can be stale by that much.  For a ship in LEO
+        # (~6 600 km altitude) Earth moves ~268 000 km between updates — far
+        # enough to destroy the orbit entirely.  Linear extrapolation reduces
+        # the error to O(a·dt_sub²) ≈ a few metres per sub-step.
+        #
+        # tick() advances sim_time by sim_dt BEFORE calling us, so:
+        #   _last_computed_jd → time of the stored positions
+        #   sim_time          → end of this tick
+        #   tick start        → sim_time − sim_dt
+        # Offset from stored positions to tick start:
+        dt_to_tick_start = (self.sim_time.jd - self._last_computed_jd) * 86400.0 - sim_dt
+
+        body_pos0_m = {}   # body position (m) extrapolated to tick start
+        body_vel3d  = {}   # body velocity (m/s) as (vx, vy, vz)
+        for name in GRAVITY_GM:
+            if name not in self.positions:
+                continue
+            bx = self.positions[name].x.to(u.m).value
+            by = self.positions[name].y.to(u.m).value
+            bz = self.positions[name].z.to(u.m).value
+            bv = self.body_vel_ms.get(name, (0.0, 0.0, 0.0))
+            bvx = bv[0]; bvy = bv[1]; bvz = bv[2] if len(bv) > 2 else 0.0
+            body_pos0_m[name] = (
+                bx + bvx * dt_to_tick_start,
+                by + bvy * dt_to_tick_start,
+                bz + bvz * dt_to_tick_start,
+            )
+            body_vel3d[name] = (bvx, bvy, bvz)
+
+        # Thrust setup — precompute direction unit vector and exhaust velocity.
+        # These are constant across all sub-steps (orientation/throttle don't
+        # change mid-tick and the mass change per step is negligible).
+        defn = self.ship.defn
+        _G0 = 9.80665  # m/s²
+        exhaust_v = defn.get("isp_s", 100_000) * _G0
+        az_rad = math.radians(self.ship._orientation_deg)
+        el_rad = math.radians(self.ship._elevation_deg)
+        cos_el = math.cos(el_rad)
+        tux = cos_el * math.cos(az_rad)
+        tuy = cos_el * math.sin(az_rad)
+        tuz = math.sin(el_rad)
 
         # Sub-step sizing: target ≤30 s per step, hard cap at 200 steps/frame
         n_steps = min(200, max(1, int(sim_dt / 30.0)))
         dt = sim_dt / n_steps
 
-        px_m = self.ship["pos_au"][0] * AU_M
-        py_m = self.ship["pos_au"][1] * AU_M
-        vx, vy = self.ship["vel_ms"]
+        px_m = self.ship.pos.x.to(u.m).value
+        py_m = self.ship.pos.y.to(u.m).value
+        pz_m = self.ship.pos.z.to(u.m).value
+        vx, vy, vz = self.ship.vel
 
-        for _ in range(n_steps):
-            ax = ay = 0.0
+        for step_i in range(n_steps):
+            # Extrapolate each body to the current sub-step time
+            t_offset = step_i * dt
+            ax = ay = az = 0.0
             hit_body = None
-            for name, (bx, by) in body_pos_m.items():
+            for name, (bx0, by0, bz0) in body_pos0_m.items():
+                bvx, bvy, bvz = body_vel3d[name]
+                bx = bx0 + bvx * t_offset
+                by = by0 + bvy * t_offset
+                bz = bz0 + bvz * t_offset
                 dx = bx - px_m
                 dy = by - py_m
-                r2 = dx * dx + dy * dy
+                dz = bz - pz_m
+                r2 = dx * dx + dy * dy + dz * dz
                 r_min_sq = BODY_MIN_DIST_SQ_M.get(name, 1e6)
                 if r2 < r_min_sq:
                     if name in BODY_MIN_DIST_SQ_M:   # real body surface → crash
@@ -850,6 +1036,7 @@ class Simulation:
                 a_mag = GRAVITY_GM[name] * inv_r * inv_r   # GM / r²
                 ax += a_mag * dx * inv_r                   # a_mag * (dx/r)
                 ay += a_mag * dy * inv_r
+                az += a_mag * dz * inv_r
 
             if hit_body:
                 self._crashed    = True
@@ -857,13 +1044,32 @@ class Simulation:
                 self.paused      = True
                 break  # stop sub-stepping on impact
 
+            # Thrust — apply engine acceleration and consume fuel
+            if self.ship._fuel_t > 0.0 and self.ship._thrust_pct > 0.0:
+                total_mass_kg = (defn["dry_mass_t"] + self.ship._fuel_t) * 1000.0
+                thrust_N      = self.ship._thrust_pct / 100.0 * defn["max_thrust_N"]
+                thrust_accel  = thrust_N / total_mass_kg
+                ax += thrust_accel * tux
+                ay += thrust_accel * tuy
+                az += thrust_accel * tuz
+                fuel_consumed_kg  = (thrust_N / exhaust_v) * dt
+                self.ship._fuel_t = max(0.0, self.ship._fuel_t - fuel_consumed_kg / 1000.0)
+                if self.ship._fuel_t <= 0.0:
+                    self.ship._thrust_pct = 0.0   # auto cut-off on empty tank
+
             # Symplectic Euler: update velocity first, then position
             vx += ax * dt
             vy += ay * dt
+            vz += az * dt
             px_m += vx * dt
             py_m += vy * dt
-        self.ship["pos_au"] = (px_m / AU_M, py_m / AU_M)
-        self.ship["vel_ms"] = (vx, vy)
+            pz_m += vz * dt
+        self.ship.pos = CartesianRepresentation(
+            (px_m / AU_M) * u.AU,
+            (py_m / AU_M) * u.AU,
+            (pz_m / AU_M) * u.AU,
+        )
+        self.ship.vel = (vx, vy, vz)
 
     # -- Time step ---------------------------------------------------------
 
