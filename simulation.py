@@ -1041,8 +1041,9 @@ class Simulation:
         tuy = cos_el * math.sin(az_rad)
         tuz = math.sin(el_rad)
 
-        # Sub-step sizing: target ≤30 s per step, hard cap 200 steps/tick
-        n_steps = min(200, max(1, int(sim_dt / 30.0)))
+        # Sub-step sizing: target ≤5 s per step for better energy conservation,
+        # hard cap 500 steps/tick to prevent excessive computation
+        n_steps = min(500, max(1, int(sim_dt / 5.0)))
         dt      = sim_dt / n_steps
 
         px_m = self.ship.pos.x.to(u.m).value

@@ -98,7 +98,7 @@ class OrreryWidget(Widget):
         self.selected_body = None
         self._overlay_rect = None
         self._image_cache = {}
-        self.show_ship_overlay = True
+        self.show_ship_overlay = False  # Hidden on startup (press W to toggle)
 
         # Ship overlay slider state
         self._ship_overlay_rect  = None  # full panel bounding rect
@@ -676,16 +676,16 @@ class OrreryWidget(Widget):
         PAD        = 14
         LINE_GAP   = 3
         GAP        = 6
-        OVERLAY_W  = 720
-        LEFT_W     = 280   # info text column
-        COL_SEP    = 16    # gap (incl. separator line) between each column pair
-        LABEL_W    = 82    # slider label column
-        VAL_W      = 58    # slider value column
+        OVERLAY_W  = 1100
+        LEFT_W     = 480   # info text column (much wider to prevent overlap)
+        COL_SEP    = 24    # gap (incl. separator line) between each column pair
+        LABEL_W    = 100   # slider label column (increased to prevent overlap)
+        VAL_W      = 70    # slider value column (increased for degree symbols)
         FUEL_COL_W = 64    # fuel indicator column
         TRACK_W    = OVERLAY_W - 2*PAD - LEFT_W - COL_SEP - LABEL_W - VAL_W - COL_SEP - FUEL_COL_W
-        TRACK_T    = 5
-        THUMB_R    = 7
-        SLIDER_H   = 28
+        TRACK_T    = 20    # track thickness (4x thicker: was 5, now 20)
+        THUMB_R    = 12    # thumb radius (bigger to match thicker track)
+        SLIDER_H   = 40    # slider row height (increased to accommodate thicker sliders)
 
         # Battery icon dimensions
         BATT_W      = 30
@@ -697,7 +697,7 @@ class OrreryWidget(Widget):
         right_h = 3 * SLIDER_H
         total_h = max(left_h, right_h) + 2 * PAD
 
-        ox = self.width - OVERLAY_W - 20
+        ox = max(20, self.width - OVERLAY_W - 40)
         oy = 20
 
         # Column x origins
@@ -994,8 +994,8 @@ class OrreryApp(App):
         info_label = Label(
             text="",
             size_hint=(None, None),
-            size=(400, 30),
-            pos_hint={"right": 0.99, "top": 0.99},
+            size=(500, 30),
+            pos_hint={"right": 0.985, "top": 0.99},
             halign="right",
             valign="middle",
             color=(0.8, 0.8, 0.8, 1),
