@@ -105,6 +105,11 @@ class OrreryWidget(Widget):
         self._ship_slider_rects = {}   # {"thrust": (x, y, w, h), ...} — track hit rects
         self._dragging_slider = None   # name of slider currently being dragged
 
+        # Ship trail and predicted trajectory
+        self._ship_trail      = []   # list of (x_au, y_au) — recent history
+        self._predicted_traj  = []   # list of (x_au, y_au) — ballistic future
+        self._pred_tick       = 0    # frame counter for throttling prediction
+
         # Celestial mechanics
         self.sim = Simulation()
 
@@ -155,6 +160,8 @@ class OrreryWidget(Widget):
             self.sim.init_ship()
             self.sim.paused = False
             self._lock_to("Earth")
+            self._ship_trail = []
+            self._predicted_traj = []
         elif key_name == "f11":
             self._fullscreen = not self._fullscreen
             Window.fullscreen = "auto" if self._fullscreen else False
@@ -412,6 +419,22 @@ class OrreryWidget(Widget):
         self.sim.tick(dt)
         if self._locked_body:
             self._update_coi_lock()
+
+        # Append ship position to historical trail (skip when crashed/paused)
+        if self.sim.ship and not self.sim._crashed:
+            self._ship_trail.append(xy(self.sim.ship.pos))
+            if len(self._ship_trail) > 3000:
+                del self._ship_trail[:len(self._ship_trail) - 3000]
+
+        # Recompute predicted trajectory every 5 frames (~6 Hz)
+        self._pred_tick += 1
+        if self._pred_tick >= 5:
+            self._pred_tick = 0
+            if self.sim.ship and not self.sim._crashed:
+                self._predicted_traj = self.sim.predict_trajectory()
+            else:
+                self._predicted_traj = []
+
         self._draw()
         self._update_info()
 
@@ -445,6 +468,7 @@ class OrreryWidget(Widget):
                     for moon in moons:
                         self._draw_body(moon)
 
+            self._draw_ship_trail()
             self._draw_ship()
             self._draw_coi_marker()
             self._draw_info_overlay()
@@ -545,6 +569,29 @@ class OrreryWidget(Widget):
         Color(r, g, b, 1)
         Ellipse(pos=(sx - px, sy - px), size=(px * 2, px * 2))
         self._draw_label(name, sx + px + 4, sy - 6, body["color"])
+
+    def _draw_ship_trail(self):
+        """Draw the historical trail (solid) and predicted trajectory (dashed)."""
+        ship = self.sim.ship
+        if ship is None:
+            return
+
+        # Historical trail — ship color at 40% alpha
+        if len(self._ship_trail) >= 2:
+            pts = []
+            for x_au, y_au in self._ship_trail:
+                pts.extend(self.world_to_screen(x_au, y_au))
+            r, g, b = ship.defn["color"]
+            Color(r, g, b, 0.4)
+            Line(points=pts, width=1.0)
+
+        # Predicted ballistic trajectory — amber dashed
+        if len(self._predicted_traj) >= 2:
+            pts = []
+            for x_au, y_au in self._predicted_traj:
+                pts.extend(self.world_to_screen(x_au, y_au))
+            Color(0.95, 0.80, 0.2, 0.55)
+            Line(points=pts, width=1.0, dash_length=8, dash_offset=8)
 
     def _draw_ship(self):
         """Draw the ship as a narrow isoceles triangle (30° apex angle)."""

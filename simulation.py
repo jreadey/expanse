@@ -948,128 +948,368 @@ class Simulation:
         )
         self.ship._sim = self
 
+    def _find_dominant_body(self, px_m, py_m, pz_m, body_pos0_m):
+        """Return the name of the body with the smallest Hill sphere that
+        contains the ship, or None if the ship is in open heliocentric space.
+
+        Choosing the *smallest* Hill sphere means a ship near the Moon gets
+        Moon-relative integration rather than Earth-relative, and a ship near
+        Earth (but outside the Moon's sphere) gets Earth-relative integration.
+        """
+        gm_sun  = GRAVITY_GM["Sun"]
+        sun_pos = body_pos0_m.get("Sun")
+        if sun_pos is None:
+            return None
+
+        best_name    = None
+        best_hill_sq = float("inf")
+
+        for name, gm in GRAVITY_GM.items():
+            if name == "Sun" or name not in body_pos0_m:
+                continue
+            bx, by, bz = body_pos0_m[name]
+
+            # Distance² from ship to this body
+            dx = px_m - bx;  dy = py_m - by;  dz = pz_m - bz
+            r_ship_sq = dx*dx + dy*dy + dz*dz
+
+            # Hill radius:
+            #   planet → relative to Sun
+            #   moon   → relative to its parent planet
+            parent = MOON_PARENT.get(name)
+            if parent and parent in body_pos0_m:
+                ppx, ppy, ppz = body_pos0_m[parent]
+                hx = bx - ppx;  hy = by - ppy;  hz = bz - ppz
+                gm_parent = GRAVITY_GM.get(parent, gm_sun)
+            else:
+                hx = bx - sun_pos[0];  hy = by - sun_pos[1];  hz = bz - sun_pos[2]
+                gm_parent = gm_sun
+
+            a_dist    = math.sqrt(hx*hx + hy*hy + hz*hz)
+            r_hill_sq = (a_dist * (gm / (3.0 * gm_parent)) ** (1.0 / 3.0)) ** 2
+
+            if r_ship_sq < r_hill_sq < best_hill_sq:
+                best_hill_sq = r_hill_sq
+                best_name    = name
+
+        return best_name
+
     def update_ship_physics(self, sim_dt):
         """Integrate ship motion under gravity using symplectic Euler.
 
-        sim_dt  -- total simulated time for this frame, in seconds.
-
-        Uses sub-steps so that near-Earth orbits remain reasonably accurate
-        even at elevated time factors.  Body positions are held fixed across
-        the sub-steps (they change slowly compared with the ship).
+        When the ship is inside a body's Hill sphere the integration is done
+        in that body's co-moving reference frame (relative-frame / Encke
+        method).  The dominant body is pinned to the origin so its gravity is
+        computed with full precision; all other bodies contribute only small
+        tidal accelerations.  This eliminates the position-extrapolation error
+        for the dominant body and produces smooth near-body orbits even at
+        high time factors.
         """
         if sim_dt <= 0.0:
             return
 
-        # Extrapolate body positions to the start of this tick using their
-        # velocities.  compute_positions() only fires every 0.1 JD (8 640 s),
-        # so self.positions[] can be stale by that much.  For a ship in LEO
-        # (~6 600 km altitude) Earth moves ~268 000 km between updates — far
-        # enough to destroy the orbit entirely.  Linear extrapolation reduces
-        # the error to O(a·dt_sub²) ≈ a few metres per sub-step.
-        #
+        # Build body position/velocity tables extrapolated to tick start.
         # tick() advances sim_time by sim_dt BEFORE calling us, so:
-        #   _last_computed_jd → time of the stored positions
+        #   _last_computed_jd → stored position epoch
         #   sim_time          → end of this tick
         #   tick start        → sim_time − sim_dt
-        # Offset from stored positions to tick start:
         dt_to_tick_start = (self.sim_time.jd - self._last_computed_jd) * 86400.0 - sim_dt
 
-        body_pos0_m = {}   # body position (m) extrapolated to tick start
-        body_vel3d  = {}   # body velocity (m/s) as (vx, vy, vz)
+        body_pos0_m = {}
+        body_vel3d  = {}
         for name in GRAVITY_GM:
             if name not in self.positions:
                 continue
             bx = self.positions[name].x.to(u.m).value
             by = self.positions[name].y.to(u.m).value
             bz = self.positions[name].z.to(u.m).value
-            bv = self.body_vel_ms.get(name, (0.0, 0.0, 0.0))
-            bvx = bv[0]; bvy = bv[1]; bvz = bv[2] if len(bv) > 2 else 0.0
-            body_pos0_m[name] = (
-                bx + bvx * dt_to_tick_start,
-                by + bvy * dt_to_tick_start,
-                bz + bvz * dt_to_tick_start,
-            )
-            body_vel3d[name] = (bvx, bvy, bvz)
+            bv  = self.body_vel_ms.get(name, (0.0, 0.0, 0.0))
+            bvx = bv[0];  bvy = bv[1];  bvz = bv[2] if len(bv) > 2 else 0.0
+            body_pos0_m[name] = (bx + bvx*dt_to_tick_start,
+                                  by + bvy*dt_to_tick_start,
+                                  bz + bvz*dt_to_tick_start)
+            body_vel3d[name]  = (bvx, bvy, bvz)
 
-        # Thrust setup — precompute direction unit vector and exhaust velocity.
-        # These are constant across all sub-steps (orientation/throttle don't
-        # change mid-tick and the mass change per step is negligible).
-        defn = self.ship.defn
-        _G0 = 9.80665  # m/s²
-        exhaust_v = defn.get("isp_s", 100_000) * _G0
-        az_rad = math.radians(self.ship._orientation_deg)
-        el_rad = math.radians(self.ship._elevation_deg)
-        cos_el = math.cos(el_rad)
+        # Thrust — precompute direction and exhaust velocity (constant per tick)
+        defn      = self.ship.defn
+        _G0       = 9.80665
+        exhaust_v = defn.get("isp_s", 350) * _G0
+        az_rad    = math.radians(self.ship._orientation_deg)
+        el_rad    = math.radians(self.ship._elevation_deg)
+        cos_el    = math.cos(el_rad)
         tux = cos_el * math.cos(az_rad)
         tuy = cos_el * math.sin(az_rad)
         tuz = math.sin(el_rad)
 
-        # Sub-step sizing: target ≤30 s per step, hard cap at 200 steps/frame
+        # Sub-step sizing: target ≤30 s per step, hard cap 200 steps/tick
         n_steps = min(200, max(1, int(sim_dt / 30.0)))
-        dt = sim_dt / n_steps
+        dt      = sim_dt / n_steps
 
         px_m = self.ship.pos.x.to(u.m).value
         py_m = self.ship.pos.y.to(u.m).value
         pz_m = self.ship.pos.z.to(u.m).value
         vx, vy, vz = self.ship.vel
 
+        # Choose integration frame
+        dominant = self._find_dominant_body(px_m, py_m, pz_m, body_pos0_m)
+
+        if dominant:
+            dbx0, dby0, dbz0 = body_pos0_m[dominant]
+            dbvx, dbvy, dbvz = body_vel3d[dominant]
+
+            # Each other body's position and velocity relative to dominant
+            # at tick start (linear extrapolation cancels out the common motion)
+            other_rel = {}
+            for name in GRAVITY_GM:
+                if name == dominant or name not in body_pos0_m:
+                    continue
+                bx0, by0, bz0 = body_pos0_m[name]
+                bvx, bvy, bvz = body_vel3d[name]
+                other_rel[name] = (bx0 - dbx0, by0 - dby0, bz0 - dbz0,
+                                   bvx - dbvx, bvy - dbvy, bvz - dbvz)
+
+            # Convert ship state into dominant body's frame
+            px_m -= dbx0;  py_m -= dby0;  pz_m -= dbz0
+            vx   -= dbvx;  vy   -= dbvy;  vz   -= dbvz
+
         for step_i in range(n_steps):
-            # Extrapolate each body to the current sub-step time
             t_offset = step_i * dt
             ax = ay = az = 0.0
             hit_body = None
-            for name, (bx0, by0, bz0) in body_pos0_m.items():
-                bvx, bvy, bvz = body_vel3d[name]
-                bx = bx0 + bvx * t_offset
-                by = by0 + bvy * t_offset
-                bz = bz0 + bvz * t_offset
-                dx = bx - px_m
-                dy = by - py_m
-                dz = bz - pz_m
-                r2 = dx * dx + dy * dy + dz * dz
-                r_min_sq = BODY_MIN_DIST_SQ_M.get(name, 1e6)
-                if r2 < r_min_sq:
-                    if name in BODY_MIN_DIST_SQ_M:   # real body surface → crash
-                        hit_body = name
-                    continue
-                inv_r = 1.0 / math.sqrt(r2)
-                a_mag = GRAVITY_GM[name] * inv_r * inv_r   # GM / r²
-                ax += a_mag * dx * inv_r                   # a_mag * (dx/r)
-                ay += a_mag * dy * inv_r
-                az += a_mag * dz * inv_r
+
+            if dominant:
+                # ── Relative-frame integration ──────────────────────────────
+                # Dominant body is always at the origin; direct gravity toward
+                # (0,0,0) — no position extrapolation error for this term.
+                r2          = px_m*px_m + py_m*py_m + pz_m*pz_m
+                r_min_sq_d  = BODY_MIN_DIST_SQ_M.get(dominant, 1e6)
+                if r2 < r_min_sq_d:
+                    hit_body = dominant
+                else:
+                    inv_r = 1.0 / math.sqrt(r2)
+                    a_mag = GRAVITY_GM[dominant] * inv_r * inv_r
+                    ax -= a_mag * px_m * inv_r
+                    ay -= a_mag * py_m * inv_r
+                    az -= a_mag * pz_m * inv_r
+
+                if not hit_body:
+                    for name, (brx0, bry0, brz0, brvx, brvy, brvz) in other_rel.items():
+                        # Position of body j relative to dominant at sub-step t
+                        brx = brx0 + brvx * t_offset
+                        bry = bry0 + brvy * t_offset
+                        brz = brz0 + brvz * t_offset
+
+                        # Direct: gravity of j on ship
+                        ddx = brx - px_m;  ddy = bry - py_m;  ddz = brz - pz_m
+                        r2_s = ddx*ddx + ddy*ddy + ddz*ddz
+                        gm_j = GRAVITY_GM[name]
+                        r_min_j = BODY_MIN_DIST_SQ_M.get(name, 1e6)
+                        if r2_s < r_min_j:
+                            if name in BODY_MIN_DIST_SQ_M:
+                                hit_body = name
+                            continue
+                        inv_d = 1.0 / math.sqrt(r2_s)
+                        a_d   = gm_j * inv_d * inv_d
+                        ax += a_d * ddx * inv_d
+                        ay += a_d * ddy * inv_d
+                        az += a_d * ddz * inv_d
+
+                        # Indirect: subtract gravity of j on dominant body
+                        # (tidal correction — keeps the frame inertial)
+                        r2_i = brx*brx + bry*bry + brz*brz
+                        if r2_i > 0.0:
+                            inv_i = 1.0 / math.sqrt(r2_i)
+                            a_i   = gm_j * inv_i * inv_i
+                            ax -= a_i * brx * inv_i
+                            ay -= a_i * bry * inv_i
+                            az -= a_i * brz * inv_i
+
+            else:
+                # ── Heliocentric integration ─────────────────────────────────
+                for name, (bx0, by0, bz0) in body_pos0_m.items():
+                    bvx, bvy, bvz = body_vel3d[name]
+                    bx = bx0 + bvx * t_offset
+                    by = by0 + bvy * t_offset
+                    bz = bz0 + bvz * t_offset
+                    dx = bx - px_m;  dy = by - py_m;  dz = bz - pz_m
+                    r2      = dx*dx + dy*dy + dz*dz
+                    r_min_sq = BODY_MIN_DIST_SQ_M.get(name, 1e6)
+                    if r2 < r_min_sq:
+                        if name in BODY_MIN_DIST_SQ_M:
+                            hit_body = name
+                        continue
+                    inv_r = 1.0 / math.sqrt(r2)
+                    a_mag = GRAVITY_GM[name] * inv_r * inv_r
+                    ax += a_mag * dx * inv_r
+                    ay += a_mag * dy * inv_r
+                    az += a_mag * dz * inv_r
 
             if hit_body:
                 self._crashed    = True
                 self._crash_body = hit_body
                 self.paused      = True
-                break  # stop sub-stepping on impact
+                break
 
             # Thrust — apply engine acceleration and consume fuel
             if self.ship._fuel_t > 0.0 and self.ship._thrust_pct > 0.0:
-                total_mass_kg = (defn["dry_mass_t"] + self.ship._fuel_t) * 1000.0
-                thrust_N      = self.ship._thrust_pct / 100.0 * defn["max_thrust_N"]
-                thrust_accel  = thrust_N / total_mass_kg
+                total_mass_kg    = (defn["dry_mass_t"] + self.ship._fuel_t) * 1000.0
+                thrust_N         = self.ship._thrust_pct / 100.0 * defn["max_thrust_N"]
+                thrust_accel     = thrust_N / total_mass_kg
                 ax += thrust_accel * tux
                 ay += thrust_accel * tuy
                 az += thrust_accel * tuz
-                fuel_consumed_kg  = (thrust_N / exhaust_v) * dt
-                self.ship._fuel_t = max(0.0, self.ship._fuel_t - fuel_consumed_kg / 1000.0)
+                fuel_kg          = (thrust_N / exhaust_v) * dt
+                self.ship._fuel_t = max(0.0, self.ship._fuel_t - fuel_kg / 1000.0)
                 if self.ship._fuel_t <= 0.0:
-                    self.ship._thrust_pct = 0.0   # auto cut-off on empty tank
+                    self.ship._thrust_pct = 0.0
 
-            # Symplectic Euler: update velocity first, then position
-            vx += ax * dt
-            vy += ay * dt
-            vz += az * dt
-            px_m += vx * dt
-            py_m += vy * dt
-            pz_m += vz * dt
+            # Symplectic Euler: velocity first, then position
+            vx += ax * dt;  vy += ay * dt;  vz += az * dt
+            px_m += vx * dt;  py_m += vy * dt;  pz_m += vz * dt
+
+        # Convert back to heliocentric if we used a relative frame
+        if dominant:
+            px_m += dbx0 + dbvx * sim_dt
+            py_m += dby0 + dbvy * sim_dt
+            pz_m += dbz0 + dbvz * sim_dt
+            vx   += dbvx;  vy += dbvy;  vz += dbvz
+
         self.ship.pos = CartesianRepresentation(
             (px_m / AU_M) * u.AU,
             (py_m / AU_M) * u.AU,
             (pz_m / AU_M) * u.AU,
         )
         self.ship.vel = (vx, vy, vz)
+
+    def predict_trajectory(self, n_points=300, total_time_s=10800.0):
+        """Return predicted ballistic trajectory as list of (x_au, y_au) positions.
+
+        Integrates the ship forward with zero thrust for *total_time_s*
+        simulation seconds and returns *n_points* sampled positions.  The
+        current ship position is prepended as the first point so the dashed
+        line connects smoothly to the ship's present location.
+        """
+        if self.ship is None or self._crashed:
+            return []
+
+        dt = total_time_s / n_points
+
+        # Snapshot ship state
+        px_m = self.ship.pos.x.to(u.m).value
+        py_m = self.ship.pos.y.to(u.m).value
+        pz_m = self.ship.pos.z.to(u.m).value
+        vx, vy, vz = self.ship.vel
+
+        # Body position/velocity tables at current epoch
+        body_pos0_m = {}
+        body_vel3d  = {}
+        for name in GRAVITY_GM:
+            if name not in self.positions:
+                continue
+            bx = self.positions[name].x.to(u.m).value
+            by = self.positions[name].y.to(u.m).value
+            bz = self.positions[name].z.to(u.m).value
+            bv  = self.body_vel_ms.get(name, (0.0, 0.0, 0.0))
+            bvx = bv[0]; bvy = bv[1]; bvz = bv[2] if len(bv) > 2 else 0.0
+            body_pos0_m[name] = (bx, by, bz)
+            body_vel3d[name]  = (bvx, bvy, bvz)
+
+        # Include current position as first point
+        points = [
+            (self.ship.pos.x.to(u.AU).value,
+             self.ship.pos.y.to(u.AU).value)
+        ]
+
+        dominant = self._find_dominant_body(px_m, py_m, pz_m, body_pos0_m)
+        t = 0.0
+
+        if dominant:
+            dbx0, dby0, dbz0 = body_pos0_m[dominant]
+            dbvx, dbvy, dbvz = body_vel3d[dominant]
+
+            other_rel = {}
+            for name in GRAVITY_GM:
+                if name == dominant or name not in body_pos0_m:
+                    continue
+                bx0, by0, bz0 = body_pos0_m[name]
+                bvx, bvy, bvz = body_vel3d[name]
+                other_rel[name] = (bx0 - dbx0, by0 - dby0, bz0 - dbz0,
+                                   bvx - dbvx, bvy - dbvy, bvz - dbvz)
+
+            # Convert to dominant's frame
+            px_m -= dbx0; py_m -= dby0; pz_m -= dbz0
+            vx   -= dbvx; vy   -= dbvy; vz   -= dbvz
+
+            for _ in range(n_points):
+                r2 = px_m*px_m + py_m*py_m + pz_m*pz_m
+                if r2 < BODY_MIN_DIST_SQ_M.get(dominant, 1.0):
+                    break
+                inv_r = 1.0 / math.sqrt(r2)
+                a_mag = GRAVITY_GM[dominant] * inv_r * inv_r
+                ax = -a_mag * px_m * inv_r
+                ay = -a_mag * py_m * inv_r
+                az = -a_mag * pz_m * inv_r
+
+                crashed = False
+                for name, (brx0, bry0, brz0, brvx, brvy, brvz) in other_rel.items():
+                    brx = brx0 + brvx * t
+                    bry = bry0 + brvy * t
+                    brz = brz0 + brvz * t
+                    ddx = brx - px_m; ddy = bry - py_m; ddz = brz - pz_m
+                    r2_s = ddx*ddx + ddy*ddy + ddz*ddz
+                    if r2_s < BODY_MIN_DIST_SQ_M.get(name, 1.0) and name in BODY_MIN_DIST_SQ_M:
+                        crashed = True; break
+                    if r2_s > 0.0:
+                        inv_d = 1.0 / math.sqrt(r2_s)
+                        a_d   = GRAVITY_GM[name] * inv_d * inv_d
+                        ax += a_d * ddx * inv_d
+                        ay += a_d * ddy * inv_d
+                        az += a_d * ddz * inv_d
+                        r2_i = brx*brx + bry*bry + brz*brz
+                        if r2_i > 0.0:
+                            inv_i = 1.0 / math.sqrt(r2_i)
+                            a_i   = GRAVITY_GM[name] * inv_i * inv_i
+                            ax -= a_i * brx * inv_i
+                            ay -= a_i * bry * inv_i
+                            az -= a_i * brz * inv_i
+                if crashed:
+                    break
+
+                vx += ax * dt; vy += ay * dt; vz += az * dt
+                px_m += vx * dt; py_m += vy * dt; pz_m += vz * dt
+                t += dt
+
+                hx = (px_m + dbx0 + dbvx * t) / AU_M
+                hy = (py_m + dby0 + dbvy * t) / AU_M
+                points.append((hx, hy))
+
+        else:
+            for _ in range(n_points):
+                ax = ay = az = 0.0
+                crashed = False
+                for name, (bx0, by0, bz0) in body_pos0_m.items():
+                    bvx, bvy, bvz = body_vel3d[name]
+                    bx = bx0 + bvx * t
+                    by = by0 + bvy * t
+                    bz = bz0 + bvz * t
+                    dx = bx - px_m; dy = by - py_m; dz = bz - pz_m
+                    r2 = dx*dx + dy*dy + dz*dz
+                    if r2 < BODY_MIN_DIST_SQ_M.get(name, 1.0) and name in BODY_MIN_DIST_SQ_M:
+                        crashed = True; break
+                    inv_r = 1.0 / math.sqrt(r2)
+                    a_mag = GRAVITY_GM[name] * inv_r * inv_r
+                    ax += a_mag * dx * inv_r
+                    ay += a_mag * dy * inv_r
+                    az += a_mag * dz * inv_r
+                if crashed:
+                    break
+
+                vx += ax * dt; vy += ay * dt; vz += az * dt
+                px_m += vx * dt; py_m += vy * dt; pz_m += vz * dt
+                t += dt
+                points.append((px_m / AU_M, py_m / AU_M))
+
+        return points
 
     # -- Time step ---------------------------------------------------------
 
