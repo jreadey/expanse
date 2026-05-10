@@ -555,6 +555,151 @@ def xy(pos):
     return pos.x.to(u.AU).value, pos.y.to(u.AU).value
 
 
+def cartesian_to_keplerian(pos_m, vel_ms, mu):
+    """Convert Cartesian position/velocity to Keplerian orbital elements.
+
+    Args:
+        pos_m: (x, y, z) position in meters relative to central body
+        vel_ms: (vx, vy, vz) velocity in m/s relative to central body
+        mu: gravitational parameter (G*M) in m³/s²
+
+    Returns:
+        (a, e, i, Omega, omega, nu, E, M) where:
+        a: semi-major axis (m)
+        e: eccentricity
+        i: inclination (rad)
+        Omega: longitude of ascending node (rad)
+        omega: argument of periapsis (rad)
+        nu: true anomaly (rad)
+        E: eccentric anomaly (rad)
+        M: mean anomaly (rad)
+    """
+    x, y, z = pos_m
+    vx, vy, vz = vel_ms
+
+    r = math.sqrt(x*x + y*y + z*z)
+    v = math.sqrt(vx*vx + vy*vy + vz*vz)
+
+    # Specific orbital energy
+    energy = v*v/2.0 - mu/r
+
+    # Semi-major axis
+    a = -mu / (2.0 * energy)
+
+    # Angular momentum vector h = r × v
+    hx = y*vz - z*vy
+    hy = z*vx - x*vz
+    hz = x*vy - y*vx
+    h = math.sqrt(hx*hx + hy*hy + hz*hz)
+
+    # Eccentricity vector e = (v × h)/μ - r/|r|
+    # v × h
+    vxh_x = vy*hz - vz*hy
+    vxh_y = vz*hx - vx*hz
+    vxh_z = vx*hy - vy*hx
+
+    ex = vxh_x/mu - x/r
+    ey = vxh_y/mu - y/r
+    ez = vxh_z/mu - z/r
+    e = math.sqrt(ex*ex + ey*ey + ez*ez)
+
+    # Inclination
+    i = math.acos(hz / h) if h > 0 else 0.0
+
+    # Node vector n = k × h (where k = (0,0,1))
+    nx = -hy
+    ny = hx
+    nz = 0.0
+    n = math.sqrt(nx*nx + ny*ny)
+
+    # Longitude of ascending node
+    if n > 0:
+        Omega = math.acos(nx / n)
+        if ny < 0:
+            Omega = 2*math.pi - Omega
+    else:
+        Omega = 0.0
+
+    # Argument of periapsis
+    if n > 0 and e > 1e-10:
+        omega = math.acos((nx*ex + ny*ey) / (n * e))
+        if ez < 0:
+            omega = 2*math.pi - omega
+    else:
+        omega = 0.0
+
+    # True anomaly
+    if e > 1e-10:
+        nu = math.acos((ex*x + ey*y + ez*z) / (e * r))
+        if x*vx + y*vy + z*vz < 0:  # Check if velocity points away from periapsis
+            nu = 2*math.pi - nu
+    else:
+        nu = 0.0
+
+    # Eccentric anomaly
+    if e < 1.0:  # elliptical orbit
+        E = 2.0 * math.atan2(math.sqrt(1-e)*math.sin(nu/2), math.sqrt(1+e)*math.cos(nu/2))
+        M = E - e * math.sin(E)
+    else:  # parabolic or hyperbolic - not handled
+        E = 0.0
+        M = 0.0
+
+    return a, e, i, Omega, omega, nu, E, M
+
+
+def keplerian_to_cartesian(a, e, i, Omega, omega, M, mu):
+    """Convert Keplerian orbital elements to Cartesian position/velocity.
+
+    Args:
+        a: semi-major axis (m)
+        e: eccentricity
+        i: inclination (rad)
+        Omega: longitude of ascending node (rad)
+        omega: argument of periapsis (rad)
+        M: mean anomaly (rad)
+        mu: gravitational parameter (G*M) in m³/s²
+
+    Returns:
+        ((x, y, z), (vx, vy, vz)) in meters and m/s
+    """
+    # Solve Kepler's equation for E
+    E = solve_kepler(M, e)
+
+    # True anomaly
+    nu = 2.0 * math.atan2(math.sqrt(1+e)*math.sin(E/2), math.sqrt(1-e)*math.cos(E/2))
+
+    # Distance
+    r = a * (1 - e * math.cos(E))
+
+    # Position in orbital plane
+    x_orb = r * math.cos(nu)
+    y_orb = r * math.sin(nu)
+
+    # Velocity in orbital plane
+    p = a * (1 - e*e)  # semi-latus rectum
+    vx_orb = -math.sqrt(mu / p) * math.sin(nu)
+    vy_orb =  math.sqrt(mu / p) * (e + math.cos(nu))
+
+    # Rotation matrices
+    cos_Om = math.cos(Omega)
+    sin_Om = math.sin(Omega)
+    cos_w = math.cos(omega)
+    sin_w = math.sin(omega)
+    cos_i = math.cos(i)
+    sin_i = math.sin(i)
+
+    # Rotate to inertial frame
+    x = (cos_Om*cos_w - sin_Om*sin_w*cos_i)*x_orb + (-cos_Om*sin_w - sin_Om*cos_w*cos_i)*y_orb
+    y = (sin_Om*cos_w + cos_Om*sin_w*cos_i)*x_orb + (-sin_Om*sin_w + cos_Om*cos_w*cos_i)*y_orb
+    z = (sin_w*sin_i)*x_orb + (cos_w*sin_i)*y_orb
+
+    vx = (cos_Om*cos_w - sin_Om*sin_w*cos_i)*vx_orb + (-cos_Om*sin_w - sin_Om*cos_w*cos_i)*vy_orb
+    vy = (sin_Om*cos_w + cos_Om*sin_w*cos_i)*vx_orb + (-sin_Om*sin_w + cos_Om*cos_w*cos_i)*vy_orb
+    vz = (sin_w*sin_i)*vx_orb + (cos_w*sin_i)*vy_orb
+
+    return (x, y, z), (vx, vy, vz)
+
+
 # ---------------------------------------------------------------------------
 # Keplerian propagation helpers
 # ---------------------------------------------------------------------------
@@ -757,6 +902,12 @@ class Simulation:
         self.moon_orbit_paths = {}  # moon: name -> [(dx,dy) AU relative to parent]
 
         self.ship = None  # set by init_ship()
+
+        # Keplerian orbit mode state (for stable orbits around single bodies)
+        self._kepler_mode = False          # True when ship is in Keplerian propagation mode
+        self._kepler_body = None           # Name of body ship orbits in Keplerian mode
+        self._kepler_elements = None       # (a, e, i, Omega, omega, M0, t0) at mode entry
+        self._kepler_epoch_jd = None       # JD when Keplerian mode was entered
 
         self.precompute_orbits()
         self.precompute_moon_orbits()
@@ -994,16 +1145,160 @@ class Simulation:
 
         return best_name
 
-    def update_ship_physics(self, sim_dt):
-        """Integrate ship motion under gravity using symplectic Euler.
+    def _compute_accel(self, px_m, py_m, pz_m, t_offset, dominant, body_pos0_m, body_vel3d, other_rel, tux, tuy, tuz, defn):
+        """Compute gravitational + thrust acceleration at a given position.
 
-        When the ship is inside a body's Hill sphere the integration is done
-        in that body's co-moving reference frame (relative-frame / Encke
-        method).  The dominant body is pinned to the origin so its gravity is
-        computed with full precision; all other bodies contribute only small
-        tidal accelerations.  This eliminates the position-extrapolation error
-        for the dominant body and produces smooth near-body orbits even at
-        high time factors.
+        Returns (ax, ay, az, hit_body) where hit_body is the name of a body the ship
+        has crashed into, or None.
+
+        For dominant-body integration: other_rel contains relative positions/velocities.
+        For heliocentric integration: body_pos0_m contains absolute positions.
+        """
+        ax = ay = az = 0.0
+        hit_body = None
+
+        if dominant:
+            # ── Relative-frame integration ──────────────────────────────
+            # Dominant body is always at the origin; direct gravity toward
+            # (0,0,0) — no position extrapolation error for this term.
+            r2          = px_m*px_m + py_m*py_m + pz_m*pz_m
+            r_min_sq_d  = BODY_MIN_DIST_SQ_M.get(dominant, 1e6)
+            if r2 < r_min_sq_d:
+                hit_body = dominant
+            else:
+                inv_r = 1.0 / math.sqrt(r2)
+                a_mag = GRAVITY_GM[dominant] * inv_r * inv_r
+                ax -= a_mag * px_m * inv_r
+                ay -= a_mag * py_m * inv_r
+                az -= a_mag * pz_m * inv_r
+
+            if not hit_body:
+                for name, (brx0, bry0, brz0, brvx, brvy, brvz) in other_rel.items():
+                    # Position of body j relative to dominant at sub-step t
+                    brx = brx0 + brvx * t_offset
+                    bry = bry0 + brvy * t_offset
+                    brz = brz0 + brvz * t_offset
+
+                    # Direct: gravity of j on ship
+                    ddx = brx - px_m;  ddy = bry - py_m;  ddz = brz - pz_m
+                    r2_s = ddx*ddx + ddy*ddy + ddz*ddz
+                    gm_j = GRAVITY_GM[name]
+                    r_min_j = BODY_MIN_DIST_SQ_M.get(name, 1e6)
+                    if r2_s < r_min_j:
+                        if name in BODY_MIN_DIST_SQ_M:
+                            hit_body = name
+                        continue
+                    inv_d = 1.0 / math.sqrt(r2_s)
+                    a_d   = gm_j * inv_d * inv_d
+                    ax += a_d * ddx * inv_d
+                    ay += a_d * ddy * inv_d
+                    az += a_d * ddz * inv_d
+
+                    # Indirect: subtract gravity of j on dominant body
+                    # (tidal correction — keeps the frame inertial)
+                    r2_i = brx*brx + bry*bry + brz*brz
+                    if r2_i > 0.0:
+                        inv_i = 1.0 / math.sqrt(r2_i)
+                        a_i   = gm_j * inv_i * inv_i
+                        ax -= a_i * brx * inv_i
+                        ay -= a_i * bry * inv_i
+                        az -= a_i * brz * inv_i
+
+        else:
+            # ── Heliocentric integration ─────────────────────────────────
+            for name, (bx0, by0, bz0) in body_pos0_m.items():
+                bvx, bvy, bvz = body_vel3d[name]
+                bx = bx0 + bvx * t_offset
+                by = by0 + bvy * t_offset
+                bz = bz0 + bvz * t_offset
+                dx = bx - px_m;  dy = by - py_m;  dz = bz - pz_m
+                r2      = dx*dx + dy*dy + dz*dz
+                r_min_sq = BODY_MIN_DIST_SQ_M.get(name, 1e6)
+                if r2 < r_min_sq:
+                    if name in BODY_MIN_DIST_SQ_M:
+                        hit_body = name
+                    continue
+                inv_r = 1.0 / math.sqrt(r2)
+                a_mag = GRAVITY_GM[name] * inv_r * inv_r
+                ax += a_mag * dx * inv_r
+                ay += a_mag * dy * inv_r
+                az += a_mag * dz * inv_r
+
+        if not hit_body:
+            # Thrust — apply engine acceleration
+            if self.ship._fuel_t > 0.0 and self.ship._thrust_pct > 0.0:
+                total_mass_kg    = (defn["dry_mass_t"] + self.ship._fuel_t) * 1000.0
+                thrust_N         = self.ship._thrust_pct / 100.0 * defn["max_thrust_N"]
+                thrust_accel     = thrust_N / total_mass_kg
+                ax += thrust_accel * tux
+                ay += thrust_accel * tuy
+                az += thrust_accel * tuz
+
+        return ax, ay, az, hit_body
+
+    def _check_keplerian_mode(self, dominant, px_m, py_m, pz_m, vx, vy, vz):
+        """Check if ship should use Keplerian propagation mode.
+
+        Returns True if:
+        - Ship is in a dominant body's Hill sphere
+        - Thrust is zero
+        - Orbit is elliptical (e < 1)
+        - Apogee is less than half the distance to the nearest moon/neighbor
+        """
+        if not dominant or self.ship._thrust_pct > 0:
+            return False
+
+        mu = GRAVITY_GM[dominant]
+
+        # Compute orbital elements
+        try:
+            a, e, i, Omega, omega, nu, E, M = cartesian_to_keplerian(
+                (px_m, py_m, pz_m), (vx, vy, vz), mu
+            )
+        except (ValueError, ZeroDivisionError):
+            return False
+
+        # Only handle elliptical orbits
+        if e >= 1.0 or a <= 0:
+            return False
+
+        # Apogee distance (distance from body center at furthest point)
+        apogee = a * (1 + e)
+
+        # Check if orbit is safely above the surface
+        # Require periapsis altitude > 1% of body radius for safety margin
+        periapsis = a * (1 - e)
+        body_radius = _BODY_RADIUS_M.get(dominant, 0)
+        periapsis_altitude = periapsis - body_radius
+        min_safe_altitude = body_radius * 0.01  # 1% of body radius
+        if periapsis_altitude < min_safe_altitude:
+            return False
+
+        # For Earth, check distance to Moon
+        if dominant == "Earth":
+            moon_dist = 384_400_000  # meters
+            if apogee > moon_dist * 0.5:
+                return False
+        # For other planets, use a fraction of Hill radius
+        else:
+            # Conservative: apogee must be < 10% of Hill radius
+            # (More sophisticated check would compute actual Hill radius)
+            hill_approx = 1e9  # 1 million km as rough Hill sphere radius
+            if apogee > hill_approx * 0.1:
+                return False
+
+        return True
+
+    def update_ship_physics(self, sim_dt):
+        """Integrate ship motion under gravity.
+
+        Uses hybrid integrator:
+        - Keplerian propagation for stable orbits around single bodies (perfect energy conservation)
+        - Velocity Verlet integration when thrust is active or orbit is perturbed
+
+        When using Velocity Verlet and the ship is inside a body's Hill sphere, integration
+        is done in that body's co-moving reference frame (Encke method) to eliminate
+        position extrapolation errors for the dominant body.
         """
         if sim_dt <= 0.0:
             return
@@ -1054,6 +1349,92 @@ class Simulation:
         # Choose integration frame
         dominant = self._find_dominant_body(px_m, py_m, pz_m, body_pos0_m)
 
+        # ═══════════════════════════════════════════════════════════════════
+        # Keplerian mode: check if we can use analytical propagation
+        # ═══════════════════════════════════════════════════════════════════
+
+        # Check if we should use/stay in Keplerian mode
+        # Once in Keplerian mode, stay there until thrust is applied or dominant body changes
+        if self._kepler_mode:
+            # Already in Keplerian mode - only exit if thrust applied or dominant body changed
+            if self.ship._thrust_pct > 0 or dominant != self._kepler_body:
+                self._kepler_mode = False
+                self._kepler_body = None
+                self._kepler_elements = None
+                self._kepler_epoch_jd = None
+        elif dominant:
+            # Not in Keplerian mode - check if we should enter
+            dbx0, dby0, dbz0 = body_pos0_m[dominant]
+            dbvx, dbvy, dbvz = body_vel3d[dominant]
+            px_rel = px_m - dbx0
+            py_rel = py_m - dby0
+            pz_rel = pz_m - dbz0
+            vx_rel = vx - dbvx
+            vy_rel = vy - dbvy
+            vz_rel = vz - dbvz
+
+            if self._check_keplerian_mode(dominant, px_rel, py_rel, pz_rel, vx_rel, vy_rel, vz_rel):
+                # Enter Keplerian mode
+                mu = GRAVITY_GM[dominant]
+                a, e, i, Omega, omega, nu, E, M0 = cartesian_to_keplerian(
+                    (px_rel, py_rel, pz_rel), (vx_rel, vy_rel, vz_rel), mu
+                )
+                self._kepler_mode = True
+                self._kepler_body = dominant
+                self._kepler_elements = (a, e, i, Omega, omega, M0)
+                # Use start of current tick as epoch (sim_time has already been advanced)
+                self._kepler_epoch_jd = self.sim_time.jd - (sim_dt / 86400.0)
+
+        # Propagate using Keplerian mode if active
+        if self._kepler_mode:
+            # Analytical propagation: update mean anomaly and convert back to Cartesian
+            a, e, i, Omega, omega, M0 = self._kepler_elements
+            mu = GRAVITY_GM[self._kepler_body]
+
+            # Time since epoch
+            dt_jd = self.sim_time.jd - self._kepler_epoch_jd
+            dt_s = dt_jd * 86400.0
+
+            # Mean motion
+            n = math.sqrt(mu / (a * a * a))
+
+            # Updated mean anomaly
+            M = M0 + n * dt_s
+            M = M % (2.0 * math.pi)
+
+            # Convert back to Cartesian in body-relative frame
+            (px_rel, py_rel, pz_rel), (vx_rel, vy_rel, vz_rel) = keplerian_to_cartesian(
+                a, e, i, Omega, omega, M, mu
+            )
+
+            # Convert to heliocentric frame
+            # Use the body's current heliocentric position from self.positions (already computed for sim_time)
+            body_helio = self.positions[self._kepler_body]
+            body_x = body_helio.x.to(u.m).value
+            body_y = body_helio.y.to(u.m).value
+            body_z = body_helio.z.to(u.m).value
+            body_vel_now = body_vel3d[self._kepler_body]
+
+            px_m = px_rel + body_x
+            py_m = py_rel + body_y
+            pz_m = pz_rel + body_z
+            vx = vx_rel + body_vel_now[0]
+            vy = vy_rel + body_vel_now[1]
+            vz = vz_rel + body_vel_now[2]
+
+            # Update ship state and exit early (skip Velocity Verlet)
+            self.ship.pos = CartesianRepresentation(
+                (px_m / AU_M) * u.AU,
+                (py_m / AU_M) * u.AU,
+                (pz_m / AU_M) * u.AU,
+            )
+            self.ship.vel = (vx, vy, vz)
+            return
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Velocity Verlet integration (when not in Keplerian mode)
+        # ═══════════════════════════════════════════════════════════════════
+
         if dominant:
             dbx0, dby0, dbz0 = body_pos0_m[dominant]
             dbvx, dbvy, dbvz = body_vel3d[dominant]
@@ -1075,75 +1456,13 @@ class Simulation:
 
         for step_i in range(n_steps):
             t_offset = step_i * dt
-            ax = ay = az = 0.0
-            hit_body = None
 
-            if dominant:
-                # ── Relative-frame integration ──────────────────────────────
-                # Dominant body is always at the origin; direct gravity toward
-                # (0,0,0) — no position extrapolation error for this term.
-                r2          = px_m*px_m + py_m*py_m + pz_m*pz_m
-                r_min_sq_d  = BODY_MIN_DIST_SQ_M.get(dominant, 1e6)
-                if r2 < r_min_sq_d:
-                    hit_body = dominant
-                else:
-                    inv_r = 1.0 / math.sqrt(r2)
-                    a_mag = GRAVITY_GM[dominant] * inv_r * inv_r
-                    ax -= a_mag * px_m * inv_r
-                    ay -= a_mag * py_m * inv_r
-                    az -= a_mag * pz_m * inv_r
-
-                if not hit_body:
-                    for name, (brx0, bry0, brz0, brvx, brvy, brvz) in other_rel.items():
-                        # Position of body j relative to dominant at sub-step t
-                        brx = brx0 + brvx * t_offset
-                        bry = bry0 + brvy * t_offset
-                        brz = brz0 + brvz * t_offset
-
-                        # Direct: gravity of j on ship
-                        ddx = brx - px_m;  ddy = bry - py_m;  ddz = brz - pz_m
-                        r2_s = ddx*ddx + ddy*ddy + ddz*ddz
-                        gm_j = GRAVITY_GM[name]
-                        r_min_j = BODY_MIN_DIST_SQ_M.get(name, 1e6)
-                        if r2_s < r_min_j:
-                            if name in BODY_MIN_DIST_SQ_M:
-                                hit_body = name
-                            continue
-                        inv_d = 1.0 / math.sqrt(r2_s)
-                        a_d   = gm_j * inv_d * inv_d
-                        ax += a_d * ddx * inv_d
-                        ay += a_d * ddy * inv_d
-                        az += a_d * ddz * inv_d
-
-                        # Indirect: subtract gravity of j on dominant body
-                        # (tidal correction — keeps the frame inertial)
-                        r2_i = brx*brx + bry*bry + brz*brz
-                        if r2_i > 0.0:
-                            inv_i = 1.0 / math.sqrt(r2_i)
-                            a_i   = gm_j * inv_i * inv_i
-                            ax -= a_i * brx * inv_i
-                            ay -= a_i * bry * inv_i
-                            az -= a_i * brz * inv_i
-
-            else:
-                # ── Heliocentric integration ─────────────────────────────────
-                for name, (bx0, by0, bz0) in body_pos0_m.items():
-                    bvx, bvy, bvz = body_vel3d[name]
-                    bx = bx0 + bvx * t_offset
-                    by = by0 + bvy * t_offset
-                    bz = bz0 + bvz * t_offset
-                    dx = bx - px_m;  dy = by - py_m;  dz = bz - pz_m
-                    r2      = dx*dx + dy*dy + dz*dz
-                    r_min_sq = BODY_MIN_DIST_SQ_M.get(name, 1e6)
-                    if r2 < r_min_sq:
-                        if name in BODY_MIN_DIST_SQ_M:
-                            hit_body = name
-                        continue
-                    inv_r = 1.0 / math.sqrt(r2)
-                    a_mag = GRAVITY_GM[name] * inv_r * inv_r
-                    ax += a_mag * dx * inv_r
-                    ay += a_mag * dy * inv_r
-                    az += a_mag * dz * inv_r
+            # Velocity Verlet step 1: compute acceleration at current position
+            ax, ay, az, hit_body = self._compute_accel(
+                px_m, py_m, pz_m, t_offset, dominant,
+                body_pos0_m, body_vel3d, other_rel if dominant else {},
+                tux, tuy, tuz, defn
+            )
 
             if hit_body:
                 self._crashed    = True
@@ -1151,22 +1470,37 @@ class Simulation:
                 self.paused      = True
                 break
 
-            # Thrust — apply engine acceleration and consume fuel
+            # Consume fuel based on thrust at current step
             if self.ship._fuel_t > 0.0 and self.ship._thrust_pct > 0.0:
-                total_mass_kg    = (defn["dry_mass_t"] + self.ship._fuel_t) * 1000.0
-                thrust_N         = self.ship._thrust_pct / 100.0 * defn["max_thrust_N"]
-                thrust_accel     = thrust_N / total_mass_kg
-                ax += thrust_accel * tux
-                ay += thrust_accel * tuy
-                az += thrust_accel * tuz
-                fuel_kg          = (thrust_N / exhaust_v) * dt
+                thrust_N = self.ship._thrust_pct / 100.0 * defn["max_thrust_N"]
+                fuel_kg  = (thrust_N / exhaust_v) * dt
                 self.ship._fuel_t = max(0.0, self.ship._fuel_t - fuel_kg / 1000.0)
                 if self.ship._fuel_t <= 0.0:
                     self.ship._thrust_pct = 0.0
 
-            # Symplectic Euler: velocity first, then position
-            vx += ax * dt;  vy += ay * dt;  vz += az * dt
-            px_m += vx * dt;  py_m += vy * dt;  pz_m += vz * dt
+            # Velocity Verlet step 2: update position using current velocity and acceleration
+            px_m += vx * dt + 0.5 * ax * dt * dt
+            py_m += vy * dt + 0.5 * ay * dt * dt
+            pz_m += vz * dt + 0.5 * az * dt * dt
+
+            # Velocity Verlet step 3: compute acceleration at new position
+            t_offset_new = (step_i + 1) * dt
+            ax_new, ay_new, az_new, hit_body_new = self._compute_accel(
+                px_m, py_m, pz_m, t_offset_new, dominant,
+                body_pos0_m, body_vel3d, other_rel if dominant else {},
+                tux, tuy, tuz, defn
+            )
+
+            if hit_body_new:
+                self._crashed    = True
+                self._crash_body = hit_body_new
+                self.paused      = True
+                break
+
+            # Velocity Verlet step 4: update velocity using average of old and new accelerations
+            vx += 0.5 * (ax + ax_new) * dt
+            vy += 0.5 * (ay + ay_new) * dt
+            vz += 0.5 * (az + az_new) * dt
 
         # Convert back to heliocentric if we used a relative frame
         if dominant:
@@ -1189,6 +1523,8 @@ class Simulation:
         simulation seconds and returns *n_points* sampled positions.  The
         current ship position is prepended as the first point so the dashed
         line connects smoothly to the ship's present location.
+
+        Uses Keplerian propagation when the predicted orbit is stable for smooth rendering.
         """
         if self.ship is None or self._crashed:
             return []
@@ -1222,6 +1558,58 @@ class Simulation:
         ]
 
         dominant = self._find_dominant_body(px_m, py_m, pz_m, body_pos0_m)
+
+        # Check if we can use Keplerian propagation for smooth prediction
+        use_keplerian = False
+        if dominant:
+            dbx0, dby0, dbz0 = body_pos0_m[dominant]
+            dbvx, dbvy, dbvz = body_vel3d[dominant]
+            px_rel = px_m - dbx0
+            py_rel = py_m - dby0
+            pz_rel = pz_m - dbz0
+            vx_rel = vx - dbvx
+            vy_rel = vy - dbvy
+            vz_rel = vz - dbvz
+
+            # Check if orbit qualifies for Keplerian propagation
+            if self._check_keplerian_mode(dominant, px_rel, py_rel, pz_rel, vx_rel, vy_rel, vz_rel):
+                use_keplerian = True
+                mu = GRAVITY_GM[dominant]
+                try:
+                    a, e, i, Omega, omega, nu, E, M0 = cartesian_to_keplerian(
+                        (px_rel, py_rel, pz_rel), (vx_rel, vy_rel, vz_rel), mu
+                    )
+                    n = math.sqrt(mu / (a * a * a))  # Mean motion
+                except (ValueError, ZeroDivisionError):
+                    use_keplerian = False
+
+        if use_keplerian:
+            # Use Keplerian propagation for smooth, accurate trajectory
+            body_helio = self.positions[dominant]
+            body_x = body_helio.x.to(u.m).value
+            body_y = body_helio.y.to(u.m).value
+            body_vel_now = body_vel3d[dominant]
+
+            for k in range(1, n_points + 1):
+                t_s = k * dt
+                # Update mean anomaly
+                M = M0 + n * t_s
+                M = M % (2.0 * math.pi)
+
+                # Convert to Cartesian
+                (px_rel_k, py_rel_k, pz_rel_k), _ = keplerian_to_cartesian(
+                    a, e, i, Omega, omega, M, mu
+                )
+
+                # Convert to heliocentric frame (body position at prediction time)
+                px_pred = px_rel_k + body_x + body_vel_now[0] * t_s
+                py_pred = py_rel_k + body_y + body_vel_now[1] * t_s
+
+                points.append((px_pred / AU_M, py_pred / AU_M))
+
+            return points
+
+        # Fall back to numerical integration
         t = 0.0
 
         if dominant:
